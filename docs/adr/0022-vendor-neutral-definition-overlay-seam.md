@@ -36,7 +36,8 @@ The overlay seam is vendor-neutral in name as well as in mechanism.
   failure restores the last accepted maps; the ETag and one-way ownership latch advance only after
   all three succeed. Concurrent callers share one in-flight refresh.
 - Opting in is the explicitly experimental
-  `catalog.experimentalAttachDefinitionOverrides({ source })`. It is one-way for the life of the
+  `ratel(config).catalog.experimentalAttachDefinitionOverrides({ source })`, on the `ratel()`
+  runtime's catalog rather than on `ToolCatalog`. It is one-way for the life of the
   process; reverting means restarting the runtime.
 - `applyDefinitionOverrides` is internal. It writes an override set straight to the live catalogs
   and so bypasses the conditional-request protocol that keeps an attachment's ETag honest; only
