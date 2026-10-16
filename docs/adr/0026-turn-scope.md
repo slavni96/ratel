@@ -82,7 +82,8 @@ can see: the recall pair's call id or the last user message (AI SDK), and the ge
 recorded through `recordToolCall` from the next step's hook, so a run's last step is not observed
 and no duration is known. `captureUserMessage: true` sends the last user message on
 `turn_start`; it is off by default. Both adapters feature-detect the turn surface, so against an
-SDK older than this decision (the ADR-0020 peer floor) they behave as before.
+SDK older than this decision (the [ADR-0028](0028-adapter-sdk-peer-floor.md) peer floor) they
+behave as before.
 
 The MCP integration is a client (`registerMcpServer`) with no request boundary of its own; its
 upstream calls run through `invoke` and inherit whatever turn is active.

@@ -572,7 +572,7 @@ jobs:
       - name: Build TS
         run: pnpm --filter "@ratel-ai/mastra..." run build
       # npm keeps `workspace:` specifiers verbatim, so pin the @ratel-ai/sdk peer AND
-      # dev deps to the ADR-0020 floor range before publishing (ephemeral CI
+      # dev deps to the ADR-0028 floor range before publishing (ephemeral CI
       # edit; not committed). Keeps the npm-OIDC dir publish + provenance identical to
       # the other units rather than switching to `pnpm publish`.
       - name: Pin the @ratel-ai/sdk peer and dev dependencies for publish
@@ -654,7 +654,7 @@ jobs:
       - name: Build TS
         run: pnpm --filter "@ratel-ai/vercel-ai-sdk..." run build
       # npm keeps `workspace:` specifiers verbatim, so pin the @ratel-ai/sdk peer AND
-      # dev deps to the ADR-0020 floor range before publishing (ephemeral CI
+      # dev deps to the ADR-0028 floor range before publishing (ephemeral CI
       # edit; not committed). Keeps the npm-OIDC dir publish + provenance identical to
       # the other units rather than switching to `pnpm publish`.
       - name: Pin the @ratel-ai/sdk peer and dev dependencies for publish

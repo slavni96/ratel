@@ -3,7 +3,7 @@ import type { ModelMessage } from "ai";
 
 /**
  * The turn surface of an adapted view. Optional because the adapter peers SDKs
- * older than the turn scope (ADR-0020's peer floor): on those, every method
+ * older than the turn scope (ADR-0028's peer floor): on those, every method
  * here is absent and the adapter records exactly what it recorded before.
  */
 export interface TurnCapableBase {

@@ -285,7 +285,7 @@ publish_telemetry_py() {
 
 # ---------- vercel-ai-sdk: @ratel-ai/vercel-ai-sdk on npm, packed locally ----------
 # The Vercel AI SDK framework adapter. Pure-TS like telemetry-ts, with a workspace:^
-# peer on @ratel-ai/sdk (pinned to the ADR-0020 floor range before pack) and a
+# peer on @ratel-ai/sdk (pinned to the ADR-0028 floor range before pack) and a
 # workspace:^ runtime dep on @ratel-ai/telemetry. `pnpm pack` rewrites remaining
 # workspace: specifiers in the tarball, so a plain `npm publish <tarball>`
 # (bootstrap: no OIDC, no provenance) ships a valid manifest.
@@ -345,7 +345,7 @@ publish_telemetry_core() {
 
 # ---------- mastra: @ratel-ai/mastra on npm, packed locally ----------
 # Pure-language framework adapter with a `workspace:^` peer on @ratel-ai/sdk
-# (pinned to the ADR-0020 floor range before pack) and a `workspace:^` runtime
+# (pinned to the ADR-0028 floor range before pack) and a `workspace:^` runtime
 # dep on @ratel-ai/telemetry. `pnpm pack` rewrites remaining workspace: specifiers
 # in the tarball, so a plain `npm publish <tarball>` (bootstrap: no OIDC, no provenance)
 # ships a valid manifest — same shape as vercel-ai-sdk.

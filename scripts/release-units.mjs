@@ -141,7 +141,7 @@ export const UNIT_IDS = Object.keys(UNITS);
 // Floor of the published `@ratel-ai/sdk` peer on both adapters. Source manifests
 // stay `workspace:^`; pin-adapter-sdk-peer.mjs rewrites this range at publish.
 // Never lower it; bump it to the SDK the adapters are built against when cutting
-// an adapter release (ADR-0020).
+// an adapter release (ADR-0028).
 export const SDK_ADAPTER_PEER_FLOOR = "0.11.0";
 export const SDK_ADAPTER_PEER_RANGE = `>=${SDK_ADAPTER_PEER_FLOOR} <1.0.0`;
 

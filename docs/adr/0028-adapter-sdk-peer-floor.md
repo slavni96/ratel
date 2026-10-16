@@ -1,10 +1,13 @@
-# 20. Adapter `@ratel-ai/sdk` peer is a 0.x floor range, not a caret of the current minor
+# 28. Adapter `@ratel-ai/sdk` peer is a 0.x floor range, not a caret of the current minor
 
 Date: 2026-08-14
 
 ## Status
 
 Accepted
+
+Numbered 0020 until 2026-10-16, when it moved to 0028: the runtime events lane
+([ADR-0020](0020-runtime-events-lane.md)) reached `main` first and keeps that number.
 
 Builds on [ADR-0008](0008-release-engineering.md) and [ADR-0013](0013-framework-adapter-spi.md).
 

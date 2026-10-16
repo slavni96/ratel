@@ -132,7 +132,7 @@ jobs:
           cd "$tmp"
           npm init -y >/dev/null
           # Co-install the current SDK on purpose: this proves the adapter's
-          # published peer range still admits the newest SDK, which is the drift ADR-0020 fixed.
+          # published peer range still admits the newest SDK, which is the drift ADR-0028 fixed.
           npm install --no-audit --no-fund \
             "@ratel-ai/vercel-ai-sdk@${{ steps.ver.outputs.adapter_spec }}" \
             "@ratel-ai/sdk@latest" \
@@ -215,7 +215,7 @@ jobs:
           cd "$tmp"
           npm init -y >/dev/null
           # Co-install the current SDK on purpose: this proves the adapter's
-          # published peer range still admits the newest SDK, which is the drift ADR-0020 fixed.
+          # published peer range still admits the newest SDK, which is the drift ADR-0028 fixed.
           npm install --no-audit --no-fund \
             "@ratel-ai/mastra@${{ steps.ver.outputs.adapter_spec }}" \
             "@ratel-ai/sdk@latest" \

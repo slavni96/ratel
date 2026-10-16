@@ -47,7 +47,7 @@ locally (no prebuilt artifacts).
 The **framework adapters** (`vercel-ai-sdk` → `@ratel-ai/vercel-ai-sdk`, `mastra` →
 `@ratel-ai/mastra`; more to come) are npm-only, pure-language units that peer-depend on
 `@ratel-ai/sdk` via `workspace:^` (rewritten at publish to the
-[ADR-0020](docs/adr/0020-adapter-sdk-peer-floor.md) floor range). Both additionally depend on
+[ADR-0028](docs/adr/0028-adapter-sdk-peer-floor.md) floor range). Both additionally depend on
 `@ratel-ai/telemetry` at publish time — a real runtime `dependencies` entry, not a peer, so
 `telemetry-ts` must be released **before** either adapter or the pinned telemetry range names
 a version that is not on npm yet. Like `telemetry-ts`, the manual helper builds them locally,
@@ -168,7 +168,7 @@ payload without applying. Run the E2E locally per `e2e/README.md`.
 
 Units version independently but do **not** publish independently when they depend on each
 other. Adapter `@ratel-ai/sdk` peers are rewritten to the
-[ADR-0020](docs/adr/0020-adapter-sdk-peer-floor.md) floor range, which does not name the
+[ADR-0028](docs/adr/0028-adapter-sdk-peer-floor.md) floor range, which does not name the
 in-repo SDK version. Telemetry `workspace:^` is still rewritten to `^X.Y.Z` of the workspace
 telemetry manifest, so a tag cut before `telemetry-ts` ships an immutable version pointing at
 a version that is not on the registry:
@@ -181,7 +181,7 @@ telemetry-core, core                                   (independent)
 
 Wait for each publish to land on its registry before tagging the next. `publish-sdk-ts`
 verifies its telemetry pin resolves on npm; `publish-mastra` and `publish-vercel-ai-sdk`
-verify their **telemetry** pin (the SDK peer is the ADR-0020 floor range and no longer names
+verify their **telemetry** pin (the SDK peer is the ADR-0028 floor range and no longer names
 the in-repo SDK version). Nothing else catches a missing telemetry: the preflight
 `npm publish --dry-run` packs locally without contacting the registry, `tag-version-check`
 only inspects the tagged unit, and `verify-install` runs after an immutable publish.
@@ -189,12 +189,12 @@ only inspects the tagged unit, and `verify-install` runs after an immutable publ
 When cutting an adapter release, set `SDK_ADAPTER_PEER_FLOOR` to the SDK version the adapters
 are built against. Never lower it — the floor is a support commitment, true by construction
 only if it matches what the adapters build against. The mechanism is 0.x-only: when the SDK
-reaches 1.0.0, delete it rather than carrying the floor forward (ADR-0020).
+reaches 1.0.0, delete it rather than carrying the floor forward (ADR-0028).
 
 After an adapter **GA** publish, move the npm `rc` dist-tag onto that GA version
 (`npm dist-tag add @ratel-ai/vercel-ai-sdk@<ga> rc`, same for mastra) so `@rc` does not keep
 serving a stale prerelease whose SDK peer is the old caret. OIDC does not cover `dist-tag`;
-this is a manual post-publish step (ADR-0020).
+this is a manual post-publish step (ADR-0028).
 
 On PyPI the constraint is stricter. `ratel-ai` floors `ratel-ai-telemetry>=0.1.3`, and under
 PEP 440 `>=0.1.3` does **not** admit `0.1.3rc1`, even with `--pre`. An RC of `sdk-py`
