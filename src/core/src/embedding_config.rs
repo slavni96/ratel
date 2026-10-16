@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
@@ -219,9 +219,10 @@ pub(crate) fn local_model_content_id_from_paths(
         .display()
         .to_string();
 
+    // Memo poison is recovered: an entry is inserted whole or not at all.
     {
         let cache = content_id_memo();
-        let guard = cache.lock().expect("local content-id memo poisoned");
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = guard.get(&memo_key)
             && entry.stamps == stamps
         {
@@ -233,7 +234,7 @@ pub(crate) fn local_model_content_id_from_paths(
     let content_id = hash_local_identity_files(&path_bufs, &name)?;
     let mut guard = content_id_memo()
         .lock()
-        .expect("local content-id memo poisoned");
+        .unwrap_or_else(PoisonError::into_inner);
     guard.insert(
         memo_key,
         ContentIdMemo {
@@ -264,12 +265,20 @@ impl LocalContentIdentity {
         }
     }
 
+    /// Poison is recovered as is: every write is a commit in [`Self::content_id`]
+    /// that cannot be left half-done. The establishing branch only runs when
+    /// `now` equals the stored stamps, so a panic between its two assignments
+    /// leaves the state as it was; the other branch is a single assignment.
+    fn lock_state(&self) -> MutexGuard<'_, LocalIdentityState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Hash and restat with the mutex released; commit only if stamps are unchanged.
     pub(crate) fn content_id(&self, dir: &Path, paths: &[&Path]) -> Result<String, EmbedderError> {
         loop {
             let now = stamp_paths(dir, paths)?;
             let snapshot = {
-                let guard = self.state.lock().expect("local content identity poisoned");
+                let guard = self.lock_state();
                 guard.clone()
             };
 
@@ -289,7 +298,7 @@ impl LocalContentIdentity {
                 continue;
             }
 
-            let mut guard = self.state.lock().expect("local content identity poisoned");
+            let mut guard = self.lock_state();
             if guard.stamps != snapshot.stamps || guard.established != snapshot.established {
                 continue;
             }
@@ -1799,6 +1808,64 @@ mod tests {
                 "unchanged stamps after an accepted touch must take the fast path"
             );
         }
+    }
+
+    #[test]
+    fn a_poisoned_content_identity_still_answers() {
+        // Before, one panic under this lock made every later artifact identity
+        // check panic on "local content identity poisoned".
+        let dir = tempfile::tempdir().unwrap();
+        write_local_model(dir.path(), b"cfg", b"tok", b"w");
+        let (identity, paths) = identity_from_dir(dir.path());
+        let refs = path_refs(&paths);
+        let established = identity.content_id(dir.path(), &refs).unwrap();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = identity.state.lock().unwrap();
+            panic!("poison the content identity");
+        }));
+        assert!(identity.state.is_poisoned(), "precondition: poisoned");
+
+        assert_eq!(identity.content_id(dir.path(), &refs).unwrap(), established);
+        touch_mtime(&dir.path().join("config.json"));
+        assert_eq!(
+            identity.content_id(dir.path(), &refs).unwrap(),
+            established,
+            "the commit path after a metadata-only touch recovers too"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_content_id_memo_still_answers() {
+        // The memo is process-wide, so one panic under it used to break every
+        // Local artifact build and warm in the process. Its entries are inserted
+        // whole, so a recovered memo is a correct cache.
+        let dir = tempfile::tempdir().unwrap();
+        write_local_model(dir.path(), b"cfg", b"tok", b"w");
+        let (_, paths) = identity_from_dir(dir.path());
+        let refs = path_refs(&paths);
+        let before = local_model_content_id_from_paths(dir.path(), &refs).unwrap();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = content_id_memo().lock().unwrap();
+            panic!("poison the content-id memo");
+        }));
+        assert!(content_id_memo().is_poisoned(), "precondition: poisoned");
+
+        assert_eq!(
+            local_model_content_id_from_paths(dir.path(), &refs).unwrap(),
+            before,
+            "memo hit"
+        );
+        touch_mtime(&dir.path().join("config.json"));
+        assert_eq!(
+            local_model_content_id_from_paths(dir.path(), &refs).unwrap(),
+            before,
+            "memo miss rehashes and re-inserts"
+        );
+        // The memo outlives this test: leave it unpoisoned for every later one
+        // in the process.
+        content_id_memo().clear_poison();
     }
 
     #[test]

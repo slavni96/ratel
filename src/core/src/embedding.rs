@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -455,12 +455,15 @@ fn get_or_load_keyed<T: ?Sized>(
     load: impl FnOnce() -> Result<Arc<T>, EmbedderError>,
 ) -> Result<(Arc<T>, Option<u64>), EmbedderError> {
     // Hold the map lock only to get/create this key's slot, then release it.
+    // Poison is recovered: an entry is either present and complete or absent.
     let slot = {
-        let mut guard = cache.lock().expect("embedder cache mutex poisoned");
+        let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(guard.entry(key.to_string()).or_default())
     };
     // Serialize per key on the slot — the map lock is NOT held across `load`.
-    let mut slot = slot.lock().expect("embedder cache slot mutex poisoned");
+    // A panicking `load` poisons the slot but never assigned it, so it is still
+    // `None` and the next call retries, the same as after an `Err`.
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(existing) = slot.as_ref() {
         return Ok((existing.clone(), None));
     }
@@ -1629,6 +1632,36 @@ mod tests {
             get_or_load_keyed(&cache, "k", || Ok::<_, EmbedderError>(Arc::new(999))).unwrap();
         assert_eq!(*v2, 7);
         assert!(ms2.is_none(), "warm reuse reports no load latency");
+    }
+
+    #[test]
+    fn a_panicking_load_leaves_the_embedder_cache_usable() {
+        // `load` runs under the key's slot mutex, so a panic inside a model load
+        // poisons that slot. Before, every later load of that model panicked on
+        // "embedder cache slot mutex poisoned" until the process restarted.
+        let cache: Mutex<HashMap<String, LoadSlot<i32>>> = Mutex::new(HashMap::new());
+        let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            get_or_load_keyed(&cache, "k", || -> Result<Arc<i32>, EmbedderError> {
+                panic!("model load panicked")
+            })
+        }));
+        assert!(load.is_err(), "the load panics");
+
+        let (v, ms) = get_or_load_keyed(&cache, "k", || Ok::<_, EmbedderError>(Arc::new(7)))
+            .expect("the slot is still empty, so the next call loads");
+        assert_eq!(*v, 7);
+        assert!(ms.is_some(), "the retry is the loading call");
+
+        // Nothing panics under the map lock today; recovery must hold anyway.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("poison the map lock");
+        }));
+        assert!(cache.is_poisoned(), "precondition: map lock poisoned");
+        let (v, ms) = get_or_load_keyed(&cache, "k", || Ok::<_, EmbedderError>(Arc::new(999)))
+            .expect("a poisoned map lock still serves the cached value");
+        assert_eq!(*v, 7);
+        assert!(ms.is_none(), "warm reuse");
     }
 
     #[test]

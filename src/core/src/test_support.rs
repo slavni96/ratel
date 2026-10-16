@@ -114,6 +114,41 @@ impl Embedder for FailOnEmbedStub {
     }
 }
 
+/// Panics on its first embed of any kind, then embeds one-hot on the word
+/// "read" (`[1, 0]`, else `[0, 1]`): a tokenizer edge case or a panicking HTTP
+/// client, hit once. Used to poison the locks an embed runs under.
+pub(crate) struct PanicOnFirstEmbedStub {
+    calls: AtomicUsize,
+}
+
+impl PanicOnFirstEmbedStub {
+    pub(crate) fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn embed(&self, text: &str) -> Vec<f32> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("embedder panicked on its first call");
+        }
+        if text.to_lowercase().contains("read") {
+            vec![1.0, 0.0]
+        } else {
+            vec![0.0, 1.0]
+        }
+    }
+}
+
+impl Embedder for PanicOnFirstEmbedStub {
+    fn embed_doc(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+        Ok(self.embed(text))
+    }
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+        Ok(self.embed(text))
+    }
+}
+
 /// Counts embeds under a fixed fingerprint (warm + extend chains).
 pub(crate) struct FpCountingEmbedder {
     fingerprint: String,

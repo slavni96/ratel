@@ -17,7 +17,7 @@
 //! id that leaves the corpus outright, which no `extend` then re-embeds.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::dense_search::dense_search;
 use crate::embedding::{Embedder, EmbedderError, embedder_with_telemetry};
@@ -181,6 +181,40 @@ impl DenseCache {
         }
     }
 
+    /// Lock the vectors and their metadata, never panicking on poison.
+    ///
+    /// A panic under this guard may have left a commit half-applied:
+    /// `extend_locked` and `warm_from_artifact_locked` write `dim`,
+    /// `built_fingerprint` and `vectors` in separate steps, and the guard is also
+    /// held across `sink.record` and the cosine ranking. Which fields are true
+    /// cannot be told afterwards, so a poisoned state is reset to "not built"
+    /// (searches report `EmbeddingsNotBuilt`, the next build re-embeds) and the
+    /// poison is cleared, so the reset happens once, not on every later lock.
+    fn lock_state(&self) -> MutexGuard<'_, DenseCacheState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            let mut state = poisoned.into_inner();
+            *state = DenseCacheState::default();
+            self.state.clear_poison();
+            state
+        })
+    }
+
+    /// The operation gate guards no data, and every operation under it commits
+    /// to `state` only after its embedder work succeeded, so a panic under it (an
+    /// embedder panicking mid-build) leaves nothing to repair: recover the guard.
+    fn operation_write(&self) -> RwLockWriteGuard<'_, ()> {
+        self.operation_lock
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Read side of [`Self::operation_write`]; same recovery.
+    fn operation_read(&self) -> RwLockReadGuard<'_, ()> {
+        self.operation_lock
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The embedder to use: an injected one (tests) or the configured model's,
     /// whose one-time load telemetry is recorded on `sink`.
     fn resolve_embedder(&self, sink: &dyn TraceSink) -> Result<Arc<dyn Embedder>, EmbedderError> {
@@ -208,7 +242,7 @@ impl DenseCache {
     /// The output width of the cached vectors, or `None` before any embedding
     /// has run. Equals the active model's output dimension.
     pub(crate) fn dim(&self) -> Option<usize> {
-        self.state.lock().expect("dense cache mutex poisoned").dim
+        self.lock_state().dim
     }
 
     /// The fingerprint of the model that built the current cache, or `None`
@@ -217,11 +251,7 @@ impl DenseCache {
     /// so it doubles as "the model the query was embedded with" for the intent
     /// graph's model check.
     pub(crate) fn built_fingerprint(&self) -> Option<String> {
-        self.state
-            .lock()
-            .expect("dense cache mutex poisoned")
-            .built_fingerprint
-            .clone()
+        self.lock_state().built_fingerprint.clone()
     }
 
     /// Embed `texts` as **queries**, returning the vectors and the resolved
@@ -246,12 +276,7 @@ impl DenseCache {
     }
 
     pub(crate) fn require_built(&self, corpus_len: usize) -> Result<(), EmbedderError> {
-        let cached = self
-            .state
-            .lock()
-            .expect("dense cache mutex poisoned")
-            .vectors
-            .len();
+        let cached = self.lock_state().vectors.len();
         if cached < corpus_len {
             return Err(EmbedderError::EmbeddingsNotBuilt);
         }
@@ -262,10 +287,7 @@ impl DenseCache {
     /// compose warm + optional extend without releasing between steps (and without
     /// re-entering [`Self::extend`], which would deadlock on this non-reentrant lock).
     pub(crate) fn with_operation_write<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
-        let _guard = self
-            .operation_lock
-            .write()
-            .expect("dense operation lock poisoned");
+        let _guard = self.operation_write();
         f(self)
     }
 
@@ -360,7 +382,7 @@ impl DenseCache {
         }
 
         let staged: Vec<Vec<f32>> = reused.iter().map(|(_, v)| v.clone()).collect();
-        let existing_dim = self.state.lock().expect("dense cache mutex poisoned").dim;
+        let existing_dim = self.lock_state().dim;
         let expected_dim = validate_batch(
             &staged,
             reused.len(),
@@ -368,7 +390,8 @@ impl DenseCache {
             &header.model_fingerprint,
         )?;
 
-        let mut state = self.state.lock().expect("dense cache mutex poisoned");
+        // First write to `state`: an embedder panic above left the cache intact.
+        let mut state = self.lock_state();
         if let Some(built) = &state.built_fingerprint
             && built != &runtime_identity
         {
@@ -433,7 +456,7 @@ impl DenseCache {
         // Gather the not-yet-cached ids so a fully-cached corpus never loads the
         // model (empty batch → early return).
         let missing: Vec<(String, String)> = {
-            let state = self.state.lock().expect("dense cache mutex poisoned");
+            let state = self.lock_state();
             items
                 .into_iter()
                 .filter(|item| !state.vectors.contains_key(item.embed_id()))
@@ -452,12 +475,13 @@ impl DenseCache {
 
         // Validate the entire batch against one staged dimension before mutating
         // the live cache. A failure leaves all missing ids missing.
-        let existing_dim = self.state.lock().expect("dense cache mutex poisoned").dim;
+        let existing_dim = self.lock_state().dim;
         let expected_dim =
             validate_batch(&vectors, missing.len(), existing_dim, &embedded.fingerprint)?;
 
-        // Commit vectors and their metadata as one state transition.
-        let mut state = self.state.lock().expect("dense cache mutex poisoned");
+        // Commit vectors and their metadata as one state transition. Nothing
+        // above wrote `state`, so an embedder panic there left the cache intact.
+        let mut state = self.lock_state();
         if let Some(built) = &state.built_fingerprint
             && built != &embedded.fingerprint
         {
@@ -485,16 +509,13 @@ impl DenseCache {
         items: impl IntoIterator<Item = &'a T>,
         sink: &dyn TraceSink,
     ) -> Result<(), EmbedderError> {
-        let _build = self
-            .operation_lock
-            .write()
-            .expect("dense operation lock poisoned");
+        let _build = self.operation_write();
         let corpus: Vec<(String, String)> = items
             .into_iter()
             .map(|item| (item.embed_id().to_string(), item.embed_text()))
             .collect();
         if corpus.is_empty() {
-            *self.state.lock().expect("dense cache mutex poisoned") = DenseCacheState::default();
+            *self.lock_state() = DenseCacheState::default();
             return Ok(());
         }
 
@@ -512,7 +533,8 @@ impl DenseCache {
             built_fingerprint: Some(embedded.fingerprint),
             dim: Some(dim),
         };
-        *self.state.lock().expect("dense cache mutex poisoned") = replacement;
+        // Assigned only after the embedder succeeded: a panic above left the old cache intact.
+        *self.lock_state() = replacement;
         Ok(())
     }
 
@@ -526,11 +548,7 @@ impl DenseCache {
     /// [`Self::require_built`] compares *counts*, so a vector left behind for a
     /// departed id could offset a new, unembedded one and let the guard pass.
     pub(crate) fn invalidate(&self, id: &str) {
-        self.state
-            .lock()
-            .expect("dense cache mutex poisoned")
-            .vectors
-            .remove(id);
+        self.lock_state().vectors.remove(id);
     }
 
     /// Validate, embed, and rank one query against one immutable cache version,
@@ -550,14 +568,11 @@ impl DenseCache {
         depth: usize,
         sink: &dyn TraceSink,
     ) -> Result<RankedWithQuery, EmbedderError> {
-        let _search = self
-            .operation_lock
-            .read()
-            .expect("dense operation lock poisoned");
+        let _search = self.operation_read();
         let items: Vec<&T> = items.into_iter().collect();
         self.require_built(items.len())?;
         let query_vec = self.embed_query(query, sink)?;
-        let ranked = self.ranked(items, &query_vec, depth);
+        let ranked = self.ranked(items, &query_vec, depth)?;
         Ok((ranked, query_vec))
     }
 
@@ -575,12 +590,7 @@ impl DenseCache {
     ) -> Result<Vec<f32>, EmbedderError> {
         let embedder = self.resolve_embedder(sink)?;
 
-        let built = self
-            .state
-            .lock()
-            .expect("dense cache mutex poisoned")
-            .built_fingerprint
-            .clone();
+        let built = self.lock_state().built_fingerprint.clone();
         let embedded = embedder.embed_query_with_identity(query)?;
         if let Some((built, active)) = model_drift(built.as_deref(), &embedded.fingerprint) {
             sink.record(TraceEvent::EmbedderModelMismatch {
@@ -591,7 +601,7 @@ impl DenseCache {
         }
 
         let vector = embedded.value;
-        if let Some(dim) = self.state.lock().expect("dense cache mutex poisoned").dim
+        if let Some(dim) = self.lock_state().dim
             && vector.len() != dim
         {
             return Err(EmbedderError::DimensionMismatch {
@@ -609,15 +619,27 @@ impl DenseCache {
     /// cache (shouldn't happen post-`require_built`) is simply skipped. The
     /// id-keyed corpus holds one entry per id, so there are no duplicates to
     /// collapse.
+    ///
+    /// The one exception is a cache with no width while there are items to
+    /// rank. Once `require_built` passed, only a poisoned-state reset (see
+    /// [`Self::lock_state`]) can produce that: every commit sets `dim`, and no
+    /// build can run under the search's read guard. Ranking would then skip
+    /// every item and report an empty success, so this returns the
+    /// `EmbeddingsNotBuilt` that `require_built` would have. It also covers a
+    /// reset during [`Self::embed_query`], which only skips its drift and width
+    /// checks: the reset is still in place here.
     pub(crate) fn ranked<'a, T: Embeddable + 'a>(
         &self,
         items: impl IntoIterator<Item = &'a T>,
         query_vec: &[f32],
         depth: usize,
-    ) -> Vec<(String, f32)> {
-        let guard = self.state.lock().expect("dense cache mutex poisoned");
+    ) -> Result<Vec<(String, f32)>, EmbedderError> {
+        let guard = self.lock_state();
+        let mut items = items.into_iter().peekable();
+        if guard.dim.is_none() && items.peek().is_some() {
+            return Err(EmbedderError::EmbeddingsNotBuilt);
+        }
         let docs: Vec<(String, &[f32])> = items
-            .into_iter()
             .filter_map(|item| {
                 guard
                     .vectors
@@ -625,7 +647,7 @@ impl DenseCache {
                     .map(|v| (item.embed_id().to_string(), v.as_slice()))
             })
             .collect();
-        dense_search(docs, query_vec, depth)
+        Ok(dense_search(docs, query_vec, depth))
     }
 }
 
@@ -681,7 +703,9 @@ mod tests {
 
     use super::*;
     use crate::embedding::Embedded;
-    use crate::test_support::{FpCountingEmbedder, PanicOnEmbedStub, build_test_artifact, unit};
+    use crate::test_support::{
+        FpCountingEmbedder, PanicOnEmbedStub, PanicOnFirstEmbedStub, build_test_artifact, unit,
+    };
     use crate::trace::{MemorySink, NoopSink, TraceEvent};
 
     struct Doc {
@@ -748,6 +772,138 @@ mod tests {
     }
 
     #[test]
+    fn an_embedder_panic_during_a_build_leaves_later_builds_and_searches_working() {
+        // A build holds the operation gate for write across inference, so a
+        // panicking embedder poisons it. Before, every later build and search
+        // panicked on "dense operation lock poisoned" until the process restarted.
+        let cache = DenseCache::with_embedder(Arc::new(PanicOnFirstEmbedStub::new()));
+        let items = vec![doc("a", "read"), doc("b", "write")];
+        let build = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.extend(&items, &NoopSink)
+        }));
+        assert!(build.is_err(), "the stub panics on its first embed");
+        assert!(
+            cache.operation_lock.is_poisoned(),
+            "precondition: the panic poisoned the operation gate"
+        );
+
+        assert!(
+            matches!(
+                cache.search_returning_query_vec(&items, "read", 2, &NoopSink),
+                Err(EmbedderError::EmbeddingsNotBuilt)
+            ),
+            "the panicked build committed nothing"
+        );
+        cache
+            .extend(&items, &NoopSink)
+            .expect("a build after the panic succeeds");
+        cache
+            .rebuild(&items, &NoopSink)
+            .expect("a rebuild after the panic succeeds");
+        let (ranked, _) = cache
+            .search_returning_query_vec(&items, "read", 2, &NoopSink)
+            .expect("a search after the panic succeeds");
+        assert_eq!(ranked[0].0, "a");
+    }
+
+    #[test]
+    fn a_poisoned_state_mutex_resets_to_not_built_rather_than_panicking() {
+        // A panic under the state guard may leave a commit half-applied: here the
+        // width moved and a vector went missing. Recovery cannot tell which
+        // fields are true, so it resets to "not built", the state every caller
+        // already handles, and clears the poison so the next build sticks.
+        let cache = DenseCache::with_embedder(Arc::new(CountingStub::new()));
+        let items = vec![doc("a", "read"), doc("b", "write")];
+        cache.extend(&items, &NoopSink).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = cache.state.lock().unwrap();
+            state.dim = Some(3);
+            state.vectors.remove("b");
+            panic!("panic halfway through a commit");
+        }));
+        assert!(cache.state.is_poisoned(), "precondition: state poisoned");
+
+        assert!(matches!(
+            cache.require_built(items.len()),
+            Err(EmbedderError::EmbeddingsNotBuilt)
+        ));
+        assert_eq!(cache.dim(), None, "the half-written width is not trusted");
+        assert_eq!(cache.built_fingerprint(), None);
+        assert!(
+            !cache.state.is_poisoned(),
+            "recovery clears the poison, so it resets once, not on every lock"
+        );
+
+        cache.extend(&items, &NoopSink).unwrap();
+        assert_eq!(cache.dim(), Some(2));
+        let (ranked, _) = cache
+            .search_returning_query_vec(&items, "read", 2, &NoopSink)
+            .expect("a search after the rebuild succeeds");
+        assert_eq!(ranked[0].0, "a");
+    }
+
+    /// Embeds like [`CountingStub`], but once armed, its next query embed first
+    /// poisons the cache's state mutex from another thread: a concurrent search
+    /// panicking under the state guard while this search sits between
+    /// `require_built` and the ranking.
+    struct PoisonStateOnQueryStub {
+        armed: Mutex<Option<std::sync::Weak<DenseCache>>>,
+    }
+    impl PoisonStateOnQueryStub {
+        fn new() -> Self {
+            Self {
+                armed: Mutex::new(None),
+            }
+        }
+        fn arm(&self, cache: &Arc<DenseCache>) {
+            *self.armed.lock().unwrap() = Some(Arc::downgrade(cache));
+        }
+    }
+    impl Embedder for PoisonStateOnQueryStub {
+        fn embed_doc(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            Ok(vec_for(text))
+        }
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            let target = self.armed.lock().unwrap().take();
+            if let Some(cache) = target.and_then(|weak| weak.upgrade()) {
+                let poisoner = std::thread::spawn(move || {
+                    let _state = cache.state.lock().unwrap();
+                    panic!("a concurrent search panicked under the state guard");
+                });
+                assert!(poisoner.join().is_err(), "the poisoning thread panicked");
+            }
+            Ok(vec_for(text))
+        }
+    }
+
+    #[test]
+    fn a_state_reset_after_require_built_fails_the_search_rather_than_ranking_nothing() {
+        // `require_built` and the ranking lock the state separately. A reset in
+        // between (another search's panic poisoned the state) left nothing to
+        // rank, and the search returned an empty ranking as success, so a
+        // hybrid search silently became BM25 only. It now reports what
+        // `require_built` would have.
+        let stub = Arc::new(PoisonStateOnQueryStub::new());
+        let cache = Arc::new(DenseCache::with_embedder(stub.clone()));
+        let items = vec![doc("a", "read"), doc("b", "write")];
+        cache.extend(&items, &NoopSink).unwrap();
+        assert!(cache.require_built(items.len()).is_ok());
+
+        stub.arm(&cache);
+        assert!(matches!(
+            cache.search_returning_query_vec(&items, "read", 2, &NoopSink),
+            Err(EmbedderError::EmbeddingsNotBuilt)
+        ));
+        assert_eq!(cache.dim(), None, "precondition: the state was reset");
+
+        cache.extend(&items, &NoopSink).unwrap();
+        let (ranked, _) = cache
+            .search_returning_query_vec(&items, "read", 2, &NoopSink)
+            .expect("a search after the rebuild succeeds");
+        assert_eq!(ranked[0].0, "a");
+    }
+
+    #[test]
     fn extend_embeds_only_the_new_tail() {
         let stub = Arc::new(CountingStub::new());
         let cache = DenseCache::with_embedder(stub.clone());
@@ -778,7 +934,7 @@ mod tests {
         assert_eq!(stub.docs(), 2, "invalidated id is re-embedded, once");
 
         let item = doc("x", "write");
-        let ranked = cache.ranked([&item], &[0.0, 1.0], 10);
+        let ranked = cache.ranked([&item], &[0.0, 1.0], 10).unwrap();
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].0, "x");
         assert!(ranked[0].1 > 0.9, "ranks with the re-embedded vector");
@@ -1092,6 +1248,18 @@ mod tests {
             cache.require_built(2),
             Err(EmbedderError::EmbeddingsNotBuilt)
         ));
+        // A partial warm has a width, so ranking still skips the uncached id
+        // rather than failing: only a reset state (no width) refuses to rank.
+        let ranked = cache.ranked(&corpus, &[1.0, 0.0], 2).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].0, "a");
+    }
+
+    #[test]
+    fn ranking_nothing_on_an_unbuilt_cache_is_an_empty_success() {
+        let cache = DenseCache::with_embedder(Arc::new(CountingStub::new()));
+        let none: [Doc; 0] = [];
+        assert!(cache.ranked(&none, &[1.0, 0.0], 2).unwrap().is_empty());
     }
 
     #[test]

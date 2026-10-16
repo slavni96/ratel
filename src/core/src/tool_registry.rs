@@ -3099,6 +3099,33 @@ mod tests {
     }
 
     #[test]
+    fn an_embedder_panic_during_build_leaves_semantic_search_working() {
+        // One panic inside an embedder (tokenizer edge case, panicking HTTP
+        // client) used to poison the dense operation lock, and from then on every
+        // semantic or hybrid search panicked until restart.
+        let mut reg = with_embedder(Arc::new(crate::test_support::PanicOnFirstEmbedStub::new()));
+        reg.register(tool("read_file", "read a file"));
+        reg.register(tool("delete_file", "delete a file"));
+        let build =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reg.build_embeddings()));
+        assert!(build.is_err(), "the stub panics on its first embed");
+
+        let before = reg.search_with_method("read", 2, Origin::Direct, SearchMethod::Semantic);
+        assert!(
+            matches!(before, Err(EmbedderError::EmbeddingsNotBuilt)),
+            "a typed error, not a panic"
+        );
+        reg.build_embeddings()
+            .expect("a build after the panic succeeds");
+        for method in [SearchMethod::Semantic, SearchMethod::Hybrid] {
+            let hits = reg
+                .search_with_method("read", 2, Origin::Direct, method)
+                .expect("a search after the panic succeeds");
+            assert_eq!(hits[0].tool_id, "read_file", "{method:?}");
+        }
+    }
+
+    #[test]
     fn a_dim_mismatch_pauses_the_arm_and_warns() {
         let sink = Arc::new(MemorySink::new("s"));
         let mut reg = with_embedder(Arc::new(StubEmbedder));

@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -450,19 +450,24 @@ impl MemorySink {
     /// A copy of the recorded envelopes, oldest first, leaving the buffer in
     /// place.
     pub fn snapshot(&self) -> Vec<TraceEnvelope> {
-        self.events.lock().expect("trace sink poisoned").clone()
+        self.lock_events().clone()
     }
 
     /// Remove and return the recorded envelopes, oldest first, emptying the
     /// buffer.
     pub fn drain(&self) -> Vec<TraceEnvelope> {
-        let mut guard = self.events.lock().expect("trace sink poisoned");
-        std::mem::take(&mut *guard)
+        std::mem::take(&mut *self.lock_events())
     }
 
     /// The session id stamped on every envelope this sink records.
     pub fn session_id(&self) -> &str {
         &self.factory.session_id
+    }
+
+    /// Poison is recovered: a push or a take either lands whole or not at all,
+    /// so the buffer behind a poisoned lock is still a correct buffer.
+    fn lock_events(&self) -> MutexGuard<'_, Vec<TraceEnvelope>> {
+        self.events.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -477,9 +482,7 @@ impl TraceSink for MemorySink {
     }
 
     fn record_envelope(&self, envelope: TraceEnvelope) {
-        if let Ok(mut guard) = self.events.lock() {
-            guard.push(envelope);
-        }
+        self.lock_events().push(envelope);
     }
 }
 
@@ -640,4 +643,35 @@ fn default_source_id() -> String {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_SOURCE_ID.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn download(bytes: u64) -> TraceEvent {
+        TraceEvent::EmbedderDownload {
+            model: "m".into(),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn a_poisoned_memory_sink_keeps_recording_and_reading() {
+        // A Vec push either lands or not, so a recovered buffer is a correct
+        // buffer. Before, `snapshot`/`drain` panicked on "trace sink poisoned"
+        // and `record` silently dropped every later event.
+        let sink = MemorySink::new("s");
+        sink.record(download(1));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sink.events.lock().unwrap();
+            panic!("poison the memory sink");
+        }));
+        assert!(sink.events.is_poisoned(), "precondition: poisoned");
+
+        sink.record(download(2));
+        assert_eq!(sink.snapshot().len(), 2, "the later event is kept");
+        assert_eq!(sink.drain().len(), 2);
+        assert!(sink.snapshot().is_empty(), "drain empties the buffer");
+    }
 }
