@@ -1,4 +1,5 @@
-//! Shared test helpers for artifact/warm embedder stubs (crate-internal, tests only).
+//! Shared test helpers (crate-internal, tests only): artifact/warm embedder
+//! stubs, and the BM25 params every registry must refuse.
 
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,6 +8,23 @@ use std::time::Duration;
 use crate::dense_cache::Embeddable;
 use crate::embedding::{Embedded, Embedder, EmbedderError};
 use crate::embedding_artifact::{ArtifactEntryKind, build_artifact};
+use crate::search::Bm25Params;
+
+/// Every way out of [`Bm25Params`]'s domain: NaN, infinite or negative `k1`,
+/// and NaN, infinite or outside-`[0, 1]` `b`.
+pub(crate) fn invalid_bm25_params() -> Vec<Bm25Params> {
+    let base = Bm25Params::default();
+    vec![
+        base.with_k1(f32::NAN),
+        base.with_k1(f32::INFINITY),
+        base.with_k1(-0.01),
+        base.with_b(f32::NAN),
+        base.with_b(f32::INFINITY),
+        base.with_b(f32::NEG_INFINITY),
+        base.with_b(-0.01),
+        base.with_b(1.01),
+    ]
+}
 
 /// L2-normalizes a fixed-dimension vector for deterministic artifact tests.
 pub(crate) fn unit<const N: usize>(values: [f32; N]) -> Vec<f32> {

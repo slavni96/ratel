@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - `JevError` is now an alias of `RankerError`, so it gains the `Refused` variant (additive: the enum is `#[non_exhaustive]`). Its `Display` names no service ("decision model config: …" instead of "jev config: …"); `describe("jev")` gives the old wording. `CandidateKind` moved to the shared module but is still exported from the crate root
 - `TraceEvent::UsageRankingStatus`'s `status` and `reason` are typed enums, `UsageRankingState` (`active`/`inactive`/`unknown`/`paused`) and `UsageRankingReason` (`enabled`/`disabled`/`rebuilt`), instead of free strings. The wire values are unchanged; a value outside the contract no longer deserializes. Rust code constructing the variant must use the enums
+- `set_experimental_bm25_params` on `ToolRegistry`, `SkillRegistry` and `FactRegistry` returns `Result<(), InvalidBm25Params>` and refuses params that fail `Bm25Params::is_valid()` (`k1` finite and >= 0, `b` finite and in `[0, 1]`), leaving the stored tuning and the cached index unchanged. Before, only the SDK bindings checked, so a crate caller could store a NaN `k1`/`b` and score every document NaN. A caller that ignores the result gets an `unused_must_use` warning, not a compile error. New export: `InvalidBm25Params`
 
 ### Fixed
 

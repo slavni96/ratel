@@ -141,7 +141,7 @@ pub use openai_decision::{
     DEFAULT_OPENAI_DECISION_URL, OpenAIDecisionConfig, OpenAIDecisionRanker,
 };
 pub use rerank::{RankCandidate, RerankOutcome, Reranker, SearchError, SearchOptions, StageOne};
-pub use search::Bm25Params;
+pub use search::{Bm25Params, InvalidBm25Params};
 pub use skill::Skill;
 pub use skill_registry::{ReplaceOutcome, SkillHit, SkillRegistry};
 pub use tool::Tool;

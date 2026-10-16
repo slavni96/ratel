@@ -2384,14 +2384,15 @@ impl ToolRegistry {
         if let Some(b) = b {
             params = params.with_b(b as f32);
         }
-        if !params.is_valid() {
-            return Err(napi::Error::from_reason(format!(
-                "experimentalBm25: k1 {} / b {} must be k1 >= 0 and b in [0, 1]",
-                params.k1, params.b
-            )));
-        }
-        registry.set_experimental_bm25_params(params);
-        Ok(())
+        // The core refuses invalid params; the message stays the SDK's own.
+        registry
+            .set_experimental_bm25_params(params)
+            .map_err(|refused| {
+                napi::Error::from_reason(format!(
+                    "experimentalBm25: k1 {} / b {} must be k1 >= 0 and b in [0, 1]",
+                    refused.0.k1, refused.0.b
+                ))
+            })
     }
 
     /// Turn adaptive usage ranking off: ranking returns to the base engine and
@@ -3504,14 +3505,15 @@ impl SkillRegistry {
         if let Some(b) = b {
             params = params.with_b(b as f32);
         }
-        if !params.is_valid() {
-            return Err(napi::Error::from_reason(format!(
-                "experimentalBm25: k1 {} / b {} must be k1 >= 0 and b in [0, 1]",
-                params.k1, params.b
-            )));
-        }
-        registry.set_experimental_bm25_params(params);
-        Ok(())
+        // The core refuses invalid params; the message stays the SDK's own.
+        registry
+            .set_experimental_bm25_params(params)
+            .map_err(|refused| {
+                napi::Error::from_reason(format!(
+                    "experimentalBm25: k1 {} / b {} must be k1 >= 0 and b in [0, 1]",
+                    refused.0.k1, refused.0.b
+                ))
+            })
     }
 
     /// Turn adaptive usage ranking off: ranking returns to the base engine and

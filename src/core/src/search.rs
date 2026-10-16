@@ -78,14 +78,37 @@ impl Bm25Params {
 
     /// Whether `k1` and `b` are both in their mathematically valid domain —
     /// `k1` finite and non-negative, `b` finite and in `[0, 1]`. Rejected
-    /// rather than clamped at the SDK boundary, same reasoning as
-    /// [`crate::ClusterPolicy`]: a clamp would silently search at a tuning the
-    /// caller did not ask for.
+    /// rather than clamped by every registry's `set_experimental_bm25_params`,
+    /// same reasoning as [`crate::ClusterPolicy`]: a clamp would silently
+    /// search at a tuning the caller did not ask for.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.k1.is_finite() && self.k1 >= 0.0 && self.b.is_finite() && (0.0..=1.0).contains(&self.b)
     }
 }
+
+/// [`Bm25Params`] outside their valid domain (see [`Bm25Params::is_valid`]),
+/// refused by every registry's `set_experimental_bm25_params`. Carries the
+/// params that were refused.
+///
+/// Refused rather than stored because a NaN or infinite `k1`/`b` makes every
+/// BM25 score NaN, and a negative `k1` or a `b` outside `[0, 1]` has no meaning
+/// in the formula.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InvalidBm25Params(pub Bm25Params);
+
+impl std::fmt::Display for InvalidBm25Params {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BM25 params k1 {} / b {} are out of range \
+             (expected k1 finite and >= 0, b finite and in [0, 1])",
+            self.0.k1, self.0.b
+        )
+    }
+}
+
+impl std::error::Error for InvalidBm25Params {}
 
 /// A prebuilt BM25 index over `(id, searchable_text)` documents: build once
 /// per corpus state, query many times. Building tokenizes and stems the whole
@@ -341,9 +364,16 @@ impl Bm25Cache {
     /// Set `k1`/`b` for future builds and invalidate the cached index — a
     /// param change must rebuild, same as any corpus mutation, or a search
     /// right after `set_params` would still score under the old tuning.
-    pub(crate) fn set_params(&self, params: Bm25Params) {
+    ///
+    /// Invalid params are refused before anything changes: the stored params
+    /// and the cached index stay as they were.
+    pub(crate) fn set_params(&self, params: Bm25Params) -> Result<(), InvalidBm25Params> {
+        if !params.is_valid() {
+            return Err(InvalidBm25Params(params));
+        }
         *self.params.lock().unwrap_or_else(PoisonError::into_inner) = params;
         self.invalidate();
+        Ok(())
     }
 }
 
@@ -667,7 +697,7 @@ mod tests {
         let low_b = cache.get_or_build(docs);
         let low_b_top = low_b.search("read", 1)[0].0.clone();
 
-        cache.set_params(Bm25Params::default().with_b(1.0));
+        cache.set_params(Bm25Params::default().with_b(1.0)).unwrap();
         let high_b = cache.get_or_build(docs);
         let high_b_top = high_b.search("read", 1)[0].0.clone();
 
@@ -681,8 +711,38 @@ mod tests {
         assert_eq!(cache.params(), Bm25Params::default());
 
         let overridden = Bm25Params::default().with_k1(1.2).with_b(0.75);
-        cache.set_params(overridden);
+        cache.set_params(overridden).unwrap();
         assert_eq!(cache.params(), overridden);
+    }
+
+    #[test]
+    fn cache_refuses_invalid_params_and_keeps_the_index_and_tuning() {
+        let docs = || vec![("read".to_string(), "read a file".to_string())];
+        let cache = Bm25Cache::new();
+        let kept = Bm25Params::default().with_k1(1.2).with_b(0.75);
+        cache.set_params(kept).unwrap();
+        let index = cache.get_or_build(docs);
+
+        for bad in crate::test_support::invalid_bm25_params() {
+            // Compared through Debug: a NaN param is never `==` itself.
+            let err = cache.set_params(bad).expect_err("must refuse");
+            assert_eq!(format!("{:?}", err.0), format!("{bad:?}"));
+            assert_eq!(cache.params(), kept, "{bad:?} must not be stored");
+            assert!(
+                Arc::ptr_eq(&index, &cache.get_or_build(docs)),
+                "{bad:?} must not invalidate the cached index"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_params_error_names_the_values_and_the_allowed_ranges() {
+        let message = InvalidBm25Params(Bm25Params { k1: -1.0, b: 2.0 }).to_string();
+        assert_eq!(
+            message,
+            "BM25 params k1 -1 / b 2 are out of range \
+             (expected k1 finite and >= 0, b finite and in [0, 1])"
+        );
     }
 
     #[test]

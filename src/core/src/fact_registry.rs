@@ -10,7 +10,7 @@ use crate::fact::{Fact, PinMode};
 use crate::fact_indexing::searchable_text;
 use crate::fusion::{RETRIEVE_DEPTH, RRF_K, rrf_fuse_weighted, sort_and_truncate};
 use crate::method::SearchMethod;
-use crate::search::{Bm25Cache, Bm25Params};
+use crate::search::{Bm25Cache, Bm25Params, InvalidBm25Params};
 use crate::trace::{ChurnKind, FactHitTrace, NoopSink, Origin, SearchStage, TraceEvent, TraceSink};
 
 /// One ranked match from a [`FactRegistry`] search, best-first in the returned
@@ -112,8 +112,15 @@ impl FactRegistry {
     /// caller who overrides it has no way to tell, from this crate alone,
     /// whether the override helped their corpus. See
     /// [`crate::ToolRegistry::set_experimental_bm25_params`].
-    pub fn set_experimental_bm25_params(&mut self, params: Bm25Params) {
-        self.bm25.set_params(params);
+    ///
+    /// # Errors
+    /// [`InvalidBm25Params`] if `params` fails [`Bm25Params::is_valid`]; the
+    /// stored tuning and the cached index are left as they were.
+    pub fn set_experimental_bm25_params(
+        &mut self,
+        params: Bm25Params,
+    ) -> Result<(), InvalidBm25Params> {
+        self.bm25.set_params(params)
     }
 
     /// The BM25 tuning the registry's index is (or will be) built with.
@@ -595,12 +602,31 @@ mod tests {
         let top = |reg: &FactRegistry| reg.search("read", 1)[0].fact_id.clone();
         assert_eq!(top(&reg), "long", "default b=0.4 favors term frequency");
 
-        reg.set_experimental_bm25_params(Bm25Params::default().with_b(1.0));
+        reg.set_experimental_bm25_params(Bm25Params::default().with_b(1.0))
+            .unwrap();
         assert_eq!(
             top(&reg),
             "short",
             "b=1.0 must reach search, not just be stored"
         );
+    }
+
+    #[test]
+    fn invalid_bm25_params_are_refused_and_leave_the_tuning_unchanged() {
+        let mut reg = FactRegistry::new();
+        let kept = Bm25Params::default().with_k1(1.2).with_b(0.75);
+        reg.set_experimental_bm25_params(kept).unwrap();
+        for bad in crate::test_support::invalid_bm25_params() {
+            assert!(
+                reg.set_experimental_bm25_params(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert_eq!(
+                reg.experimental_bm25_params(),
+                kept,
+                "{bad:?} must not be stored"
+            );
+        }
     }
 
     #[test]
