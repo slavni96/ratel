@@ -135,7 +135,7 @@ load_skill = get_skill_content_tool(skills)
 
 When your agent needs to act, it calls `search_capabilities`. Ratel searches separate tool and skill indexes and returns focused results from each. Tools can be invoked by id; skill instructions stay out of context until the agent loads a relevant playbook with `get_skill_content`.
 
-The indexes use BM25 by default, the same algorithm behind most search engines, applied to each tool's name, description and argument names, and to skill names, descriptions, and tags. Retrieval is fast and deterministic. Semantic and hybrid ranking are opt-in per catalog or per call; SDK callers register (which embeds) and search dense indexes asynchronously, using either an in-process model or an OpenAI-compatible embedding endpoint.
+The indexes use BM25 by default, the same algorithm behind most search engines, applied to each tool's name and description plus its arguments' names, descriptions, and enum values, and to skill names, descriptions, and tags. Retrieval is fast and deterministic. Semantic and hybrid ranking are opt-in per catalog or per call; SDK callers register (which embeds) and search dense indexes asynchronously, using either an in-process model or an OpenAI-compatible embedding endpoint.
 
 [Full docs](https://docs.ratel.sh)
 
@@ -159,7 +159,11 @@ src/
 ├── adapters/ts-mastra/ # @ratel-ai/mastra — Mastra adapter
 └── telemetry/         # OTel conventions + helper packages
 protocol/              # catalog-source wire contract
+├── v1/                # the current contract, frozen
+└── v2/                # experimental preview: v1 plus searchableDescription
+e2e/                   # cross-SDK checks against the built, installed packages
 examples/              # End-to-end SDK examples
+scripts/               # release tooling and its node:test suites, plus repo contract tests
 docs/
 ├── adr/                # Architecture decision records
 └── assets/             # Images and other static assets
@@ -167,7 +171,7 @@ docs/
 
 ## Build & test
 
-Prerequisites: Rust stable, Node 24+, pnpm 10.28+. Python SDK: Python 3.9+ and [`uv`](https://docs.astral.sh/uv/).
+Prerequisites: Rust stable, Node 24+, pnpm 10.28+. Python SDK: Python 3.11 (the dev and CI version) and [`uv`](https://docs.astral.sh/uv/); the published package runs on Python 3.9+ (`requires-python`, also tested in CI).
 
 ```bash
 cargo build --workspace && cargo test --workspace   # Rust

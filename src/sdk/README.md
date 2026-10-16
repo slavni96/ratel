@@ -24,6 +24,6 @@ Binding strategy and tool-injection mode are documented in [ADR 0006](../../docs
 
 ## `python/` — `ratel-ai`
 
-The Python SDK. Bundles `ratel-ai-core` via a [PyO3](https://pyo3.rs) native binding under [`python/native/`](python/native/README.md), distributed as prebuilt `abi3` wheels. Full feature parity with the TS SDK. See [`python/README.md`](python/README.md) for usage.
+The Python SDK. Bundles `ratel-ai-core` via a [PyO3](https://pyo3.rs) native binding under [`python/native/`](python/native/README.md), distributed as prebuilt `abi3` wheels. Near parity with the TS SDK: retrieval experiments, the `callback` trace sink, the `ratel()` adapter SPI, `validateInput`, the definition overlay and `advertiseSkills` are TypeScript-only. See [`python/README.md`](python/README.md) for usage.
 
 Binding strategy is documented in [ADR 0006](../../docs/adr/0006-native-ffi-bindings.md).

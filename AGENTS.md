@@ -10,7 +10,7 @@ If you're a human, you probably want [README.md](README.md).
 
 ## Build & test
 
-Prerequisites: Rust stable (pinned via `rust-toolchain.toml`), Node 24+, pnpm 10.28+. The Python SDK also needs Python 3.11 and [`uv`](https://docs.astral.sh/uv/).
+Prerequisites: Rust stable (`rust-toolchain.toml` selects `channel = "stable"`, which tracks the latest stable release rather than pinning a version), Node 24+, pnpm 10.28+. The Python SDK also needs Python 3.11 (the dev and CI version) and [`uv`](https://docs.astral.sh/uv/); the published package runs on Python 3.9+ (`requires-python`, also tested in CI).
 
 ```bash
 # Rust

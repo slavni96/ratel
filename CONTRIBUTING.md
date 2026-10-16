@@ -6,7 +6,7 @@ This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md) v2.1. By par
 
 ## Prerequisites
 
-- **Rust** stable — pinned via `rust-toolchain.toml`; rustup picks it up automatically.
+- **Rust** stable — `rust-toolchain.toml` selects `channel = "stable"` (it tracks the latest stable release, not a pinned version) plus clippy and rustfmt; rustup picks it up automatically.
 - **Node** 24+
 - **pnpm** 10.28+ (see `packageManager` in `package.json`)
 
