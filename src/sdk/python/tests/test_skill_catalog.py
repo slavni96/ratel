@@ -195,7 +195,7 @@ async def test_skill_catalog_register_empty_batch_on_semantic_is_a_noop() -> Non
     assert catalog.size() == 0
 
 
-async def test_nonempty_skill_async_search_and_busy_registration(
+async def test_nonempty_skill_async_search_and_waiting_registration(
     controlled_embedding_endpoint: tuple[str, threading.Event, threading.Event],
 ) -> None:
     endpoint, request_started, send_response = controlled_embedding_endpoint
@@ -209,11 +209,14 @@ async def test_nonempty_skill_async_search_and_busy_registration(
         await asyncio.sleep(0.01)
     assert request_started.is_set()
     try:
-        with pytest.raises(RuntimeError, match=r"^registry busy; await the active operation$"):
-            await catalog.register(Skill(id="deploy", name="deploy", description="Deploy an app"))
+        # The first register's embedding owns the registry; this one waits.
+        pending = catalog.register(Skill(id="deploy", name="deploy", description="Deploy an app"))
+        assert not catalog.has("deploy")
     finally:
         send_response.set()
     await register
+    await pending
+    assert catalog.has("deploy")
 
     hits = await catalog.search_async("authentication", 5)
     assert hits[0].skill_id == "auth"

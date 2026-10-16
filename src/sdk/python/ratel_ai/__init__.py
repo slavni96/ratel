@@ -68,6 +68,7 @@ from .exceptions import (
     DimensionMismatchError,
     EmbedderError,
     IncompatibleMergeError,
+    RegistryBusyError,
     RetrieverError,
 )
 from .intent_graph_storage import (
@@ -139,6 +140,7 @@ __all__ = [
     "RankCandidateKind",
     "RankedId",
     "RankFn",
+    "RegistryBusyError",
     "RerankerConfig",
     "RetrieverError",
     "RetrieverPlugin",

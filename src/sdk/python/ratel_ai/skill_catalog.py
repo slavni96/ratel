@@ -20,12 +20,12 @@ from ._custom_ranking import RankFn, custom_rerank, custom_search
 from ._native import IntentGraph as IntentGraph  # re-exported for `ratel_ai.IntentGraph`
 from ._native import NativeEventSubscription, SkillHit
 from ._native import SkillRegistry as _NativeSkillRegistry
+from ._registry_gate import _RegistryGate
 from .catalog import (
     _CUSTOM_NEEDS_ASYNC,
     _DEFAULT_RERANKER_DEPTH,
     _DENSE_METHODS,
     _DISABLED_RANKING_STATUS,
-    _REGISTRY_BUSY,
     _RERANKER_NEEDS_ASYNC,
     _UNAWAITED_REGISTER,
     AdaptiveRankingStatus,
@@ -139,7 +139,7 @@ class PendingReplace(ReplaceOutcome):
         return ReplaceOutcome(self.added, self.removed, self.updated, self.unchanged)
 
 
-class SkillRegistry:
+class SkillRegistry(_RegistryGate):
     """Typed Python facade over the private native skill registry."""
 
     @overload
@@ -275,6 +275,7 @@ class SkillRegistry:
         self._dense_gate = threading.Lock()
         self._dense_state = threading.Lock()
         self._dense_pending = 0
+        self._init_gate()
         # See `ToolRegistry.__init__`: scheduled-but-undriven dense preparation, so
         # a forgotten `await register(...)` is caught at the next dense search.
         self._undriven_builds = 0
@@ -317,6 +318,9 @@ class SkillRegistry:
         it embeds in one batched, off-thread pass; with
         ``experimental_embedding_artifact`` it warms first (any method); plain
         "bm25" without an artifact is a no-op. Always `await` the result.
+
+        While a dense operation is in flight, the returned awaitable waits for
+        it and then writes, instead of raising — see `ToolRegistry.register`.
         """
         flat_args = (name, description, tags, tools, metadata, body)
         if isinstance(item, Skill):
@@ -333,8 +337,7 @@ class SkillRegistry:
             skills = list(item)
             if not all(isinstance(skill, Skill) for skill in skills):
                 raise TypeError("register requires Skill items")
-        self._register_items(skills)
-        return self._build_tracked(bool(skills))
+        return self._write_or_queue(lambda: self._register_items(skills), bool(skills))
 
     def replace_all(self, skills: Iterable[Skill]) -> PendingReplace:
         """Make `skills` the entire corpus — see `SkillCatalog.replace_all`.
@@ -342,7 +345,8 @@ class SkillRegistry:
         The corpus swap lands **synchronously** (a forgotten `await` never
         leaves a half-applied reload); the returned `PendingReplace` already
         carries the counts and drives dense preparation when awaited.
-        Always `await` the result.
+        Always `await` the result. Unlike `register`, it cannot wait: while an
+        operation owns the registry it raises `RegistryBusyError`.
         """
         batch = list(skills)
         if not all(isinstance(skill, Skill) for skill in batch):
@@ -389,7 +393,7 @@ class SkillRegistry:
             EmbedderError: Embedding failed during artifact build.
             ArtifactError: Non-embedder artifact encode failure from native build.
         """
-        self._queue_dense()
+        await self._enter_dense()
         runner = self._run_artifact_build_task()
         try:
             task = asyncio.create_task(runner)
@@ -416,21 +420,34 @@ class SkillRegistry:
             lambda: self._native._warm_embeddings_from_artifact(artifact, on_miss)
         )
 
-    async def _ensure_dense_ready(self) -> None:
+    async def _ensure_dense_ready(self, *, admitted: bool = False) -> None:
+        """Warm the configured artifact, or embed — see `ToolRegistry._ensure_dense_ready`."""
         if self._embedding_artifact is not None:
-            self._queue_dense()
+            if admitted:
+                self._queue_dense()
+            else:
+                await self._enter_dense()
             try:
                 artifact_bytes, on_miss = await resolve_embedding_artifact(self._embedding_artifact)
-                await self.experimental_warm_embeddings_from_artifact(artifact_bytes, on_miss)
+                await self._run_dense(
+                    lambda: self._native._warm_embeddings_from_artifact(artifact_bytes, on_miss),
+                    admitted=True,
+                )
             finally:
                 self._finish_dense()
             return
         if self._eager:
-            await self._build()
+            await self._build(admitted=admitted)
 
-    async def _build(self) -> None:
+    def _schedules_dense(self, has_items: bool) -> bool:
+        return self._embedding_artifact is not None or (self._eager and has_items)
+
+    async def _prepare_dense_held(self) -> None:
+        await self._ensure_dense_ready(admitted=True)
+
+    async def _build(self, *, admitted: bool = False) -> None:
         """Embed not-yet-embedded items on a worker thread (used by `register`)."""
-        await self._run_dense(self._native._build_embeddings)
+        await self._run_dense(self._native._build_embeddings, admitted=admitted)
 
     async def _rebuild(self) -> None:
         """Recompute and atomically replace the full embedding cache (internal)."""
@@ -438,7 +455,7 @@ class SkillRegistry:
 
     def _build_tracked(self, has_items: bool) -> Awaitable[None]:
         """The awaitable `register` returns — see `ToolRegistry._build_tracked`."""
-        schedule = self._embedding_artifact is not None or (self._eager and has_items)
+        schedule = self._schedules_dense(has_items)
         if schedule:
             self._undriven_builds += 1
 
@@ -475,6 +492,7 @@ class SkillRegistry:
         if method == "custom":
             if retrieve_fn is None:
                 raise ValueError('method "custom" needs a retrieve_fn')
+            await self._after_writes()
             return await custom_search(
                 self._native, "skill", retrieve_fn, query, top_k, origin, ambient
             )
@@ -490,6 +508,7 @@ class SkillRegistry:
                 ambient,
             )
         if method == "bm25" and reranker is None:
+            await self._after_writes()
             return self.search_with_origin(query, top_k, origin, projection)
         if self._undriven_builds > 0:
             raise RuntimeError(_UNAWAITED_REGISTER)
@@ -512,6 +531,7 @@ class SkillRegistry:
     ) -> Any:
         turn_id = (ambient or {}).get("turn_id")
         if method not in _DENSE_METHODS:
+            await self._after_writes()
             return self._native._stage_one(query, top_k, depth, method, turn_id)
         if self._undriven_builds > 0:
             raise RuntimeError(_UNAWAITED_REGISTER)
@@ -774,8 +794,13 @@ class SkillRegistry:
         """Drain captured native trace events."""
         return self._native.drain_trace_events()
 
-    async def _run_dense(self, operation: Callable[[], _DenseResult]) -> _DenseResult:
-        self._queue_dense()
+    async def _run_dense(
+        self, operation: Callable[[], _DenseResult], *, admitted: bool = False
+    ) -> _DenseResult:
+        if admitted:
+            self._queue_dense()
+        else:
+            await self._enter_dense()
         runner = self._run_dense_task(operation)
         try:
             task = asyncio.create_task(runner)
@@ -806,14 +831,6 @@ class SkillRegistry:
         self._dense_tasks.discard(task)
         if not task.cancelled():
             task.exception()
-
-    def _queue_dense(self) -> None:
-        with self._dense_state:
-            self._dense_pending += 1
-
-    def _finish_dense(self) -> None:
-        with self._dense_state:
-            self._dense_pending -= 1
 
     def _register_items(self, skills: Iterable[Skill]) -> None:
         skills = list(skills)
@@ -873,10 +890,6 @@ class SkillRegistry:
             outcome.unchanged,
             self._build_tracked(has_items),
         )
-
-    def _raise_if_busy(self) -> None:
-        if self._dense_pending:
-            raise RuntimeError(_REGISTRY_BUSY)
 
 
 class SkillCatalog:
@@ -976,18 +989,26 @@ class SkillCatalog:
             skills: a single `Skill` or an iterable of them. Pass the whole batch
                 at once for a single dense-preparation request.
 
+        While a dense operation on this catalog is in flight, the skills cannot
+        be stored yet: on a running event loop, instead of raising "registry
+        busy", the returned awaitable waits for it, then stores and prepares
+        them, and a `search_async` started after the call runs after it — see
+        `ToolCatalog.register`.
+
         Raises:
             EmbedderError: when embedding fails (when awaited).
             ArtifactWarmError: when a configured artifact fails (when awaited).
-            RuntimeError: if another operation already owns the registry —
-                dense work, but also an in-flight BM25 `search_async` holding
-                the read lock. `registry busy` is retryable, not fatal.
+            RegistryBusyError: if a dense operation is in flight and no event
+                loop is running to wait on.
         """
         batch = [skills] if isinstance(skills, Skill) else list(skills)
-        self._registry._register_items(batch)
-        for skill in batch:
-            self._skills[skill.id] = skill
-        return self._registry._build_tracked(bool(batch))
+
+        def write() -> None:
+            self._registry._register_items(batch)
+            for skill in batch:
+                self._skills[skill.id] = skill
+
+        return self._registry._write_or_queue(write, bool(batch))
 
     def replace_all(self, skills: Iterable[Skill]) -> PendingReplace:
         """Make `skills` the entire content of the catalog.
@@ -1022,9 +1043,10 @@ class SkillCatalog:
             TypeError: if any item is not a `Skill`.
             EmbedderError: when embedding fails (when awaited).
             ArtifactWarmError: when a configured artifact fails (when awaited).
-            RuntimeError: if another operation already owns the registry —
-                dense work, but also an in-flight BM25 `search_async` holding
-                the read lock. `registry busy` is retryable, not fatal.
+            RegistryBusyError: if dense work is in flight on the registry, or
+                a `register` is waiting for it. Unlike `register`, a reload
+                cannot wait, because its counts are returned synchronously.
+                Retryable, not fatal; a `RuntimeError` subclass.
         """
         batch = list(skills)
         awaitable = self._registry.replace_all(batch)

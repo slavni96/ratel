@@ -14,6 +14,9 @@ API. ``ArtifactWarmError`` covers warm failures and carries ``code`` /
 ``RetrieverError`` is raised by, or for, a caller-supplied ranking function
 (``retrieve_fn`` / ``reranker_fn``, ADR-0027); the Jev and OpenAI Decisions plugins
 raise it for every failure.
+
+``RegistryBusyError`` is the refusal a synchronous registry mutation still
+raises while an operation owns the registry.
 """
 
 from __future__ import annotations
@@ -25,6 +28,30 @@ from ._native import (
     EmbedderError,
     IncompatibleMergeError,
 )
+
+_REGISTRY_BUSY = "registry busy; await the active operation"
+
+
+class RegistryBusyError(RuntimeError):
+    """A synchronous registry mutation was refused: an operation owns the registry.
+
+    The operation is a dense one (a semantic or hybrid search, an embedding
+    pass, an artifact build or warm) or a queued ``register``. ``register``
+    itself does not raise it while it can wait: on a running event loop it
+    returns an awaitable that applies the write once the operation settles. It
+    comes from the calls that cannot wait, such as ``SkillCatalog.replace_all``,
+    ``set_trace_sink``, ``experimental_enable_adaptive_ranking``, and a
+    ``register`` called with no running event loop. Retryable: await the
+    operation in flight, then call again.
+
+    A ``RuntimeError`` with the message the plain ``RuntimeError`` carried, so
+    existing ``except RuntimeError`` handlers and message checks keep working.
+    Mirrors the TypeScript SDK's ``RegistryBusyError``.
+    """
+
+    def __init__(self, message: str = _REGISTRY_BUSY) -> None:
+        """Create the error; the message defaults to the one the refusal always had."""
+        super().__init__(message)
 
 
 class RetrieverError(RuntimeError):
@@ -74,5 +101,6 @@ __all__ = [
     "DimensionMismatchError",
     "EmbedderError",
     "IncompatibleMergeError",
+    "RegistryBusyError",
     "RetrieverError",
 ]

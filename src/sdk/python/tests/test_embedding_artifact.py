@@ -15,6 +15,7 @@ from ratel_ai import (
     ArtifactWarmError,
     ExecutableTool,
     IncompatibleMergeError,
+    RegistryBusyError,
     Skill,
     SkillCatalog,
     SkillRegistry,
@@ -487,7 +488,7 @@ async def test_build_concurrent_with_semantic_search(
     assert hits[0].tool_id == "read_file"
 
 
-async def test_mutation_rejected_while_build_pending(
+async def test_register_waits_while_build_pending(
     counting_embedding_endpoint: tuple[str, _CountingEndpoint],
 ) -> None:
     url, state = counting_embedding_endpoint
@@ -498,14 +499,18 @@ async def test_mutation_rejected_while_build_pending(
     state.arm_batch_hold(1)
     build_task = asyncio.create_task(reg.experimental_build_embedding_artifact())
     await _wait_hold(state)
-    with pytest.raises(RuntimeError, match="registry busy"):
-        await reg.register(WRITE_FILE)
+    # A synchronous mutation is still refused; register waits instead.
+    with pytest.raises(RegistryBusyError, match="registry busy"):
+        reg.set_trace_sink("noop")
+    pending = reg.register(WRITE_FILE)
+    assert [hit.tool_id for hit in reg.search("write", 5)] == []
     state.release_held()
     await build_task
-    await reg.register(WRITE_FILE)
+    await pending
+    assert reg.search("write", 5)[0].tool_id == "write_file"
 
 
-async def test_cancel_await_keeps_mutation_blocked_until_build_finishes(
+async def test_cancel_await_keeps_register_waiting_until_build_finishes(
     counting_embedding_endpoint: tuple[str, _CountingEndpoint],
 ) -> None:
     url, state = counting_embedding_endpoint
@@ -519,20 +524,12 @@ async def test_cancel_await_keeps_mutation_blocked_until_build_finishes(
     build_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await build_task
-    with pytest.raises(RuntimeError, match="registry busy"):
-        await reg.register(WRITE_FILE)
+    # The cancelled await leaves the native build running, so this waits for it.
+    pending = reg.register(WRITE_FILE)
+    assert [hit.tool_id for hit in reg.search("write", 5)] == []
     state.release_held()
-    # Give the worker a moment to finish and clear pending.
-    for _ in range(50):
-        try:
-            await reg.register(WRITE_FILE)
-            break
-        except RuntimeError as err:
-            if "registry busy" not in str(err):
-                raise
-            await asyncio.sleep(0.05)
-    else:
-        pytest.fail("mutation stayed busy after build finished")
+    await pending
+    assert reg.search("write", 5)[0].tool_id == "write_file"
 
 
 async def test_skill_replace_all_warms_configured_artifact(
@@ -853,7 +850,7 @@ def _blocked_resolve(
     return resolve
 
 
-async def test_mutation_rejected_while_artifact_warm_pending(
+async def test_register_waits_while_artifact_warm_pending(
     counting_embedding_endpoint: tuple[str, _CountingEndpoint],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -878,16 +875,18 @@ async def test_mutation_rejected_while_artifact_warm_pending(
     first = asyncio.ensure_future(catalog.register(_executable(READ_FILE)))
     await entered.wait()
     try:
-        with pytest.raises(RuntimeError, match="registry busy"):
-            catalog.register(_executable(WRITE_FILE))
+        # Queued behind the first register's warm, not refused or applied under it.
+        second = catalog.register(_executable(WRITE_FILE))
+        assert not catalog.has("write_file")
     finally:
         release.set()
     await first
+    await second
     assert catalog.has("read_file")
-    assert not catalog.has("write_file")
+    assert catalog.has("write_file")
 
 
-async def test_skill_register_rejected_while_artifact_warm_pending(
+async def test_skill_register_waits_while_artifact_warm_pending(
     counting_embedding_endpoint: tuple[str, _CountingEndpoint],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -912,14 +911,15 @@ async def test_skill_register_rejected_while_artifact_warm_pending(
     first = asyncio.ensure_future(catalog.register(SLIDES))
     await entered.wait()
     try:
-        with pytest.raises(RuntimeError, match="registry busy"):
-            catalog.register(API_DESIGN)
+        second = catalog.register(API_DESIGN)
+        assert not catalog.has("api-design")
     finally:
         release.set()
     await first
+    await second
     assert catalog.has("frontend-slides")
-    assert not catalog.has("api-design")
-    assert catalog.size() == 1
+    assert catalog.has("api-design")
+    assert catalog.size() == 2
 
 
 async def test_replace_all_rejected_while_artifact_warm_pending(

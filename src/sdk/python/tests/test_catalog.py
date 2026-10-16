@@ -51,20 +51,6 @@ def _read_file_tool(execute) -> ExecutableTool:
     )
 
 
-async def _register_when_idle(catalog: ToolCatalog, tool: ExecutableTool) -> None:
-    deadline = asyncio.get_running_loop().time() + 2
-    while True:
-        try:
-            await catalog.register(tool)
-            return
-        except RuntimeError as err:
-            if str(err) != "registry busy; await the active operation":
-                raise
-            if asyncio.get_running_loop().time() >= deadline:
-                raise AssertionError("dense worker did not finish") from err
-            await asyncio.sleep(0.01)
-
-
 class _PausingTool(Tool):
     def __init__(
         self, reached: threading.Event, release: threading.Event, *, tool_id: str = "raced"
@@ -380,7 +366,7 @@ async def test_delayed_endpoint_search_keeps_asyncio_responsive(
     assert hits[0].tool_id == "read_file" and heartbeats >= 5
 
 
-async def test_cancelled_dense_register_keeps_registration_busy_until_worker_finishes(
+async def test_cancelled_dense_register_makes_the_next_register_wait_for_its_worker(
     delayed_embedding_endpoint: str,
 ) -> None:
     catalog = ToolCatalog(
@@ -393,17 +379,13 @@ async def test_cancelled_dense_register_keeps_registration_busy_until_worker_fin
     with pytest.raises(asyncio.CancelledError):
         await register
 
-    with pytest.raises(RuntimeError, match=r"^registry busy; await the active operation$"):
-        await catalog.register(
-            ExecutableTool(
-                id="send", name="send", description="Send email", execute=lambda args: {}
-            )
-        )
-
-    await _register_when_idle(
-        catalog,
-        ExecutableTool(id="send", name="send", description="Send email", execute=lambda args: {}),
+    # The cancelled caller leaves its worker running, so the registry is still
+    # busy; the next register waits for that worker rather than raising.
+    pending = catalog.register(
+        ExecutableTool(id="send", name="send", description="Send email", execute=lambda args: {})
     )
+    assert not catalog.has("send")
+    await pending
     assert catalog.has("send")
 
 
@@ -455,12 +437,11 @@ async def test_cancelled_failing_dense_worker_exception_is_consumed(
         loop.set_exception_handler(previous_handler)
 
 
-async def test_second_registration_raises_busy_while_first_still_embedding(
+async def test_second_registration_waits_while_first_still_embedding(
     delayed_embedding_endpoint: str,
 ) -> None:
-    # No standalone build/rebuild remains to queue two dense ops behind one
-    # another; a single in-flight eager register already exercises the same
-    # "busy while a dense op owns the registry" invariant.
+    # A single in-flight eager register owns the registry; a second register
+    # made meanwhile waits for it instead of raising "registry busy".
     catalog = ToolCatalog(
         method="semantic",
         embedding={"url": delayed_embedding_endpoint, "model": "test-model"},
@@ -468,14 +449,11 @@ async def test_second_registration_raises_busy_while_first_still_embedding(
     first = asyncio.create_task(catalog.register(_read_file_tool(lambda args: {})))
     await asyncio.sleep(0.02)
 
-    with pytest.raises(RuntimeError, match=r"^registry busy; await the active operation$"):
-        await catalog.register(
-            ExecutableTool(
-                id="send", name="send", description="Send email", execute=lambda args: {}
-            )
-        )
-
+    await catalog.register(
+        ExecutableTool(id="send", name="send", description="Send email", execute=lambda args: {})
+    )
     await first
+    assert catalog.has("read_file") and catalog.has("send")
 
 
 @pytest.mark.parametrize("batch", [False, True])

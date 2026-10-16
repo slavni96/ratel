@@ -27,9 +27,9 @@ from typing import Any, Literal, TypeVar, cast, overload
 
 from ._native import FactHit
 from ._native import FactRegistry as _NativeFactRegistry
+from ._registry_gate import _RegistryGate
 from .capabilities import _clamp_top_k
 from .catalog import (
-    _REGISTRY_BUSY,
     _UNAWAITED_REGISTER,
     EmbeddingSpec,
     SearchMethod,
@@ -144,7 +144,7 @@ class Fact:
     experimental_searchable_description: str | None = None
 
 
-class FactRegistry:
+class FactRegistry(_RegistryGate):
     """Typed Python facade over the private native fact registry."""
 
     @overload
@@ -248,6 +248,7 @@ class FactRegistry:
         self._dense_gate = threading.Lock()
         self._dense_state = threading.Lock()
         self._dense_pending = 0
+        self._init_gate()
         # See `SkillRegistry.__init__`: scheduled-but-undriven embedding builds,
         # so a forgotten `await register(...)` is caught at the next dense search.
         self._undriven_builds = 0
@@ -289,7 +290,8 @@ class FactRegistry:
         only the embedding pass. On a "semantic"/"hybrid" registry it embeds in
         one batched, off-thread pass (errors surface when awaited); "bm25" has
         nothing to embed. Always `await` the result. Mirrors
-        `SkillRegistry.register`, minus `tools` and plus `pin`.
+        `SkillRegistry.register`, minus `tools` and plus `pin`: while a dense
+        operation is in flight, the awaitable waits for it and then writes.
         """
         flat_args = (name, description, tags, metadata, body, pin)
         if isinstance(item, Fact):
@@ -306,8 +308,7 @@ class FactRegistry:
             facts = list(item)
             if not all(isinstance(fact, Fact) for fact in facts):
                 raise TypeError("register requires Fact items")
-        self._register_items(facts)
-        return self._build_tracked(bool(facts))
+        return self._write_or_queue(lambda: self._register_items(facts), bool(facts))
 
     def search(self, query: str, top_k: int) -> list[FactHit]:
         """Run synchronous, model-free BM25 retrieval."""
@@ -330,9 +331,15 @@ class FactRegistry:
             )
         return self.search_with_origin(query, top_k, origin)
 
-    async def _build(self) -> None:
+    async def _build(self, *, admitted: bool = False) -> None:
         """Embed not-yet-embedded items on a worker thread (used by `register`)."""
-        await self._run_dense(self._native._build_embeddings)
+        await self._run_dense(self._native._build_embeddings, admitted=admitted)
+
+    def _schedules_dense(self, has_items: bool) -> bool:
+        return self._eager and has_items
+
+    async def _prepare_dense_held(self) -> None:
+        await self._build(admitted=True)
 
     async def _rebuild(self) -> None:
         """Recompute and atomically replace the full embedding cache (internal)."""
@@ -340,7 +347,7 @@ class FactRegistry:
 
     def _build_tracked(self, has_items: bool) -> Awaitable[None]:
         """The awaitable `register` returns — see `SkillRegistry._build_tracked`."""
-        schedule = self._eager and has_items
+        schedule = self._schedules_dense(has_items)
         if schedule:
             self._undriven_builds += 1
 
@@ -365,6 +372,7 @@ class FactRegistry:
         if method not in ("bm25", "semantic", "hybrid"):
             raise ValueError(f"unknown search method: {method}")
         if method == "bm25":
+            await self._after_writes()
             return self.search_with_origin(query, top_k, origin)
         if self._undriven_builds > 0:
             raise RuntimeError(_UNAWAITED_REGISTER)
@@ -394,8 +402,13 @@ class FactRegistry:
         """Drain captured native trace events."""
         return self._native.drain_trace_events()
 
-    async def _run_dense(self, operation: Callable[[], _DenseResult]) -> _DenseResult:
-        self._queue_dense()
+    async def _run_dense(
+        self, operation: Callable[[], _DenseResult], *, admitted: bool = False
+    ) -> _DenseResult:
+        if admitted:
+            self._queue_dense()
+        else:
+            await self._enter_dense()
         runner = self._run_dense_task(operation)
         try:
             task = asyncio.create_task(runner)
@@ -427,14 +440,6 @@ class FactRegistry:
         if not task.cancelled():
             task.exception()
 
-    def _queue_dense(self) -> None:
-        with self._dense_state:
-            self._dense_pending += 1
-
-    def _finish_dense(self) -> None:
-        with self._dense_state:
-            self._dense_pending -= 1
-
     def _register_items(self, facts: Iterable[Fact]) -> None:
         facts = list(facts)
         # Validate the whole batch before indexing any of it — enforced HERE, not
@@ -460,10 +465,6 @@ class FactRegistry:
                 ]
             )
             record_catalog_definitions("fact", facts, self._emitted_definition_hashes)
-
-    def _raise_if_busy(self) -> None:
-        if self._dense_pending:
-            raise RuntimeError(_REGISTRY_BUSY)
 
 
 class FactCatalog:
@@ -532,19 +533,28 @@ class FactCatalog:
             facts: a single `Fact` or an iterable of them. Pass the whole batch at
                 once for a single embedding request.
 
+        While a dense operation on this catalog is in flight, on a running
+        event loop the returned awaitable waits for it and then stores the
+        facts, instead of raising "registry busy" — see `ToolCatalog.register`.
+        Validation still happens at the call.
+
         Raises:
             ValueError: if a fact's `id` or `pin` is invalid.
             EmbedderError: on a semantic/hybrid catalog, if embedding fails (when awaited).
-            RuntimeError: if a dense operation already owns the registry.
+            RegistryBusyError: if a dense operation is in flight and no event
+                loop is running to wait on.
         """
         batch = [facts] if isinstance(facts, Fact) else list(facts)
-        # Validation lives in `_register_items` (the registry is public too),
-        # which checks the whole batch before indexing any of it — so the local
-        # map below can only ever see facts the registry accepted.
-        self._registry._register_items(batch)
-        for fact in batch:
-            self._facts[fact.id] = fact
-        return self._registry._build_tracked(bool(batch))
+
+        def write() -> None:
+            # Validation lives in `_register_items` (the registry is public too),
+            # which checks the whole batch before indexing any of it — so the
+            # local map below can only ever see facts the registry accepted.
+            self._registry._register_items(batch)
+            for fact in batch:
+                self._facts[fact.id] = fact
+
+        return self._registry._write_or_queue(write, bool(batch))
 
     def search(
         self,

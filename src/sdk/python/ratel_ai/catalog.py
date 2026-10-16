@@ -24,6 +24,7 @@ from ._custom_ranking import RankFn, custom_rerank, custom_search
 from ._native import IntentGraph as IntentGraph  # re-exported for `ratel_ai.IntentGraph`
 from ._native import NativeEventSubscription, SearchHit, public_model_identity
 from ._native import ToolRegistry as _NativeToolRegistry
+from ._registry_gate import _RegistryGate
 from .embedding_artifact import (
     ExperimentalEmbeddingArtifact,
     OnArtifactMiss,
@@ -391,7 +392,6 @@ _DISABLED_RANKING_STATUS: dict[str, Any] = {
 }
 
 
-_REGISTRY_BUSY = "registry busy; await the active operation"
 _UNAWAITED_REGISTER = (
     "a register() call was not awaited; dense preparation did not complete — "
     "`await catalog.register(...)` (or `registry.register(...)`) before a "
@@ -541,7 +541,7 @@ class AdaptiveRankingStatus(str):
         return self
 
 
-class ToolRegistry:
+class ToolRegistry(_RegistryGate):
     """Typed Python facade over the private native tool registry."""
 
     @overload
@@ -678,6 +678,7 @@ class ToolRegistry:
         self._dense_gate = threading.Lock()
         self._dense_state = threading.Lock()
         self._dense_pending = 0
+        self._init_gate()
         # Builds scheduled by `register` but not yet driven to completion. Bumped
         # synchronously so a *forgotten* `await register(...)` leaves it > 0; the
         # dense search path reads it to fail loudly instead of ranking an empty
@@ -720,6 +721,18 @@ class ToolRegistry:
         (errors surface when awaited); with ``experimental_embedding_artifact``
         it warms that artifact first (any method); plain "bm25" without an
         artifact is a no-op. Always `await` the result.
+
+        While a dense operation on this registry is in flight (a dense
+        ``search_async``, an embedding pass, an artifact build or warm), the
+        write cannot land yet: called on a running event loop, it takes its
+        place in line at the call and a task already scheduled on that loop
+        waits for the operation, then writes and prepares, so the write still
+        lands if it is never awaited. The returned awaitable is a coroutine
+        over that task, so it can also go to ``asyncio.create_task`` or a
+        ``TaskGroup``; cancelling what awaits it before the write lands drops
+        the write. An async search started after the call runs after the
+        write. Called with no running event loop, it cannot wait and raises
+        ``RegistryBusyError``, as before.
         """
         flat_args = (name, description, input_schema, output_schema)
         if isinstance(item, Tool):
@@ -736,8 +749,7 @@ class ToolRegistry:
             tools = list(item)
             if not all(isinstance(tool, Tool) for tool in tools):
                 raise TypeError("register requires Tool items")
-        self._register_items(tools)
-        return self._build_tracked(bool(tools))
+        return self._write_or_queue(lambda: self._register_items(tools), bool(tools))
 
     def search(self, query: str, top_k: int) -> list[SearchHit]:
         """Run synchronous, model-free BM25 retrieval."""
@@ -778,7 +790,7 @@ class ToolRegistry:
             EmbedderError: Embedding failed during artifact build.
             ArtifactError: Non-embedder artifact encode failure from native build.
         """
-        self._queue_dense()
+        await self._enter_dense()
         runner = self._run_artifact_build_task()
         try:
             task = asyncio.create_task(runner)
@@ -805,21 +817,40 @@ class ToolRegistry:
             lambda: self._native._warm_embeddings_from_artifact(artifact, on_miss)
         )
 
-    async def _ensure_dense_ready(self) -> None:
+    async def _ensure_dense_ready(self, *, admitted: bool = False) -> None:
+        """Warm the configured artifact, or embed on an eager registry.
+
+        ``admitted`` means the caller already holds the registry (a queued
+        register applying itself), so nothing here waits for admission.
+        """
         if self._embedding_artifact is not None:
-            self._queue_dense()
+            if admitted:
+                self._queue_dense()
+            else:
+                await self._enter_dense()
             try:
                 artifact_bytes, on_miss = await resolve_embedding_artifact(self._embedding_artifact)
-                await self.experimental_warm_embeddings_from_artifact(artifact_bytes, on_miss)
+                # Inside the slot taken above: not the public warm, which would
+                # queue behind a register waiting for this very slot.
+                await self._run_dense(
+                    lambda: self._native._warm_embeddings_from_artifact(artifact_bytes, on_miss),
+                    admitted=True,
+                )
             finally:
                 self._finish_dense()
             return
         if self._eager:
-            await self._build()
+            await self._build(admitted=admitted)
 
-    async def _build(self) -> None:
+    def _schedules_dense(self, has_items: bool) -> bool:
+        return self._embedding_artifact is not None or (self._eager and has_items)
+
+    async def _prepare_dense_held(self) -> None:
+        await self._ensure_dense_ready(admitted=True)
+
+    async def _build(self, *, admitted: bool = False) -> None:
         """Embed not-yet-embedded items on a worker thread (used by `register`)."""
-        await self._run_dense(self._native._build_embeddings)
+        await self._run_dense(self._native._build_embeddings, admitted=admitted)
 
     async def _rebuild(self) -> None:
         """Recompute and atomically replace the full embedding cache (internal)."""
@@ -832,7 +863,7 @@ class ToolRegistry:
         runs), not inside the coroutine, so it stays > 0 when the coroutine is
         never driven — that is how a forgotten `await` becomes detectable.
         """
-        schedule = self._embedding_artifact is not None or (self._eager and has_items)
+        schedule = self._schedules_dense(has_items)
         if schedule:
             self._undriven_builds += 1
 
@@ -871,6 +902,7 @@ class ToolRegistry:
         if method == "custom":
             if retrieve_fn is None:
                 raise ValueError('method "custom" needs a retrieve_fn')
+            await self._after_writes()
             return await custom_search(
                 self._native, "tool", retrieve_fn, query, top_k, origin, ambient
             )
@@ -886,6 +918,7 @@ class ToolRegistry:
                 ambient,
             )
         if method == "bm25" and reranker is None:
+            await self._after_writes()
             return self.search_with_origin(query, top_k, origin, projection)
         if self._undriven_builds > 0:
             raise RuntimeError(_UNAWAITED_REGISTER)
@@ -908,6 +941,7 @@ class ToolRegistry:
     ) -> Any:
         turn_id = (ambient or {}).get("turn_id")
         if method not in _DENSE_METHODS:
+            await self._after_writes()
             return self._native._stage_one(query, top_k, depth, method, turn_id)
         if self._undriven_builds > 0:
             raise RuntimeError(_UNAWAITED_REGISTER)
@@ -1224,8 +1258,13 @@ class ToolRegistry:
         """Drain captured native trace events."""
         return self._native.drain_trace_events()
 
-    async def _run_dense(self, operation: Callable[[], _DenseResult]) -> _DenseResult:
-        self._queue_dense()
+    async def _run_dense(
+        self, operation: Callable[[], _DenseResult], *, admitted: bool = False
+    ) -> _DenseResult:
+        if admitted:
+            self._queue_dense()
+        else:
+            await self._enter_dense()
         runner = self._run_dense_task(operation)
         try:
             task = asyncio.create_task(runner)
@@ -1263,14 +1302,6 @@ class ToolRegistry:
             # failure so asyncio does not report an unhandled task exception.
             task.exception()
 
-    def _queue_dense(self) -> None:
-        with self._dense_state:
-            self._dense_pending += 1
-
-    def _finish_dense(self) -> None:
-        with self._dense_state:
-            self._dense_pending -= 1
-
     def _register_items(self, tools: Iterable[Tool]) -> None:
         tools = list(tools)
         with self._dense_state:
@@ -1289,10 +1320,6 @@ class ToolRegistry:
                 ]
             )
             record_catalog_definitions("tool", tools, self._emitted_definition_hashes)
-
-    def _raise_if_busy(self) -> None:
-        if self._dense_pending:
-            raise RuntimeError(_REGISTRY_BUSY)
 
 
 class BaselineTurn:
@@ -1484,6 +1511,20 @@ class ToolCatalog:
         corpus. Re-registering an id replaces it in place; the index never holds
         a duplicate.
 
+        While a dense operation on this catalog is in flight (a dense
+        `search_async`, another register's embedding pass, an artifact warm),
+        the tools cannot be stored yet. Called on a running event loop, the
+        register takes its place in line at the call instead of raising
+        "registry busy", and a task already scheduled on that loop waits for
+        the operation, then stores, indexes and prepares the tools, so the
+        write lands even if it is never awaited. The returned awaitable is a
+        coroutine over that task (it works with `asyncio.create_task` and a
+        `TaskGroup`). A `search_async` started after the
+        call runs after the write, so it sees the new tools. A `retrieve_fn` /
+        `reranker_fn` in progress does not hold a register back. Called with no
+        running event loop (plain synchronous code), it cannot wait and raises
+        `RegistryBusyError`, as it did before.
+
         A model or dimension change is not recovered in place — construct a new
         catalog and re-register.
 
@@ -1497,23 +1538,27 @@ class ToolCatalog:
             ValueError: if any `execute` is `None`, or a schema isn't JSON-serializable.
             EmbedderError: when embedding fails (when awaited).
             ArtifactWarmError: when a configured artifact fails (when awaited).
-            RuntimeError: if a dense operation already owns the registry.
+            RegistryBusyError: if a dense operation is in flight and no event
+                loop is running to wait on.
         """
         batch = [tools] if isinstance(tools, ExecutableTool) else list(tools)
         for tool in batch:
             if tool.execute is None:
                 raise ValueError(f"tool {tool.id!r} has no execute handler")
-        self._registry._register_items(batch)
-        for tool in batch:
-            self._executors[tool.id] = tool.execute
-            self._tools[tool.id] = Tool(
-                id=tool.id,
-                name=tool.name,
-                description=tool.description,
-                input_schema=tool.input_schema,
-                output_schema=tool.output_schema,
-            )
-        return self._registry._build_tracked(bool(batch))
+
+        def write() -> None:
+            self._registry._register_items(batch)
+            for tool in batch:
+                self._executors[tool.id] = tool.execute
+                self._tools[tool.id] = Tool(
+                    id=tool.id,
+                    name=tool.name,
+                    description=tool.description,
+                    input_schema=tool.input_schema,
+                    output_schema=tool.output_schema,
+                )
+
+        return self._registry._write_or_queue(write, bool(batch))
 
     def search(
         self,
