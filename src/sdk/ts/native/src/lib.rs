@@ -1891,13 +1891,16 @@ impl ToolRegistry {
     }
 
     /// Lexical BM25 search: up to `topK` hits, best-first with ties broken by
-    /// id. Model-free and infallible; an empty registry returns `[]`. Records
-    /// the query on the local trace stream with origin `"direct"`.
+    /// id. Model-free and infallible for any query; an empty registry returns
+    /// `[]`. A poisoned registry lock throws rather than aborting the process,
+    /// as on every other entry point. Records the query on the local trace
+    /// stream with origin `"direct"`.
     #[napi]
-    pub fn search(&self, query: String, top_k: u32) -> Vec<SearchHit> {
-        self.inner
+    pub fn search(&self, query: String, top_k: u32) -> napi::Result<Vec<SearchHit>> {
+        Ok(self
+            .inner
             .read()
-            .expect("tool registry lock poisoned")
+            .map_err(|_| napi::Error::from_reason("tool registry lock poisoned"))?
             .search(&query, top_k as usize)
             .into_iter()
             .map(|hit| SearchHit {
@@ -1907,7 +1910,7 @@ impl ToolRegistry {
                 fused: hit.fused,
                 relevance: f64::from(hit.relevance),
             })
-            .collect()
+            .collect())
     }
 
     /// BM25 search with an explicit origin — `"agent"` for a call the model
@@ -1915,11 +1918,17 @@ impl ToolRegistry {
     /// (host code). Origin only annotates the trace event; ranking is
     /// identical to `search`.
     #[napi]
-    pub fn search_with_origin(&self, query: String, top_k: u32, origin: String) -> Vec<SearchHit> {
+    pub fn search_with_origin(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+    ) -> napi::Result<Vec<SearchHit>> {
         let parsed = parse_origin(origin.as_str());
-        self.inner
+        Ok(self
+            .inner
             .read()
-            .expect("tool registry lock poisoned")
+            .map_err(|_| napi::Error::from_reason("tool registry lock poisoned"))?
             .search_with_origin(&query, top_k as usize, parsed)
             .into_iter()
             .map(|hit| SearchHit {
@@ -1929,7 +1938,7 @@ impl ToolRegistry {
                 fused: hit.fused,
                 relevance: f64::from(hit.relevance),
             })
-            .collect()
+            .collect())
     }
 
     /// Synchronous method search. Accepts BM25 only; semantic/hybrid callers use
@@ -2702,36 +2711,43 @@ impl FactRegistry {
     /// Lexical BM25 search over facts — see `ToolRegistry.search` for the
     /// contract (best-first, ties by id, infallible, traced as `"direct"`).
     #[napi]
-    pub fn search(&self, query: String, top_k: u32) -> Vec<FactHit> {
-        self.inner
+    pub fn search(&self, query: String, top_k: u32) -> napi::Result<Vec<FactHit>> {
+        Ok(self
+            .inner
             .read()
-            .expect("fact registry lock poisoned")
+            .map_err(|_| napi::Error::from_reason("fact registry lock poisoned"))?
             .search(&query, top_k as usize)
             .into_iter()
             .map(|hit| FactHit {
                 fact_id: hit.fact_id,
                 score: hit.score as f64,
             })
-            .collect()
+            .collect())
     }
 
     /// BM25 search with an explicit origin — see `ToolRegistry.searchWithOrigin`.
     #[napi]
-    pub fn search_with_origin(&self, query: String, top_k: u32, origin: String) -> Vec<FactHit> {
+    pub fn search_with_origin(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+    ) -> napi::Result<Vec<FactHit>> {
         let parsed = match origin.as_str() {
             "agent" => Origin::Agent,
             _ => Origin::Direct,
         };
-        self.inner
+        Ok(self
+            .inner
             .read()
-            .expect("fact registry lock poisoned")
+            .map_err(|_| napi::Error::from_reason("fact registry lock poisoned"))?
             .search_with_origin(&query, top_k as usize, parsed)
             .into_iter()
             .map(|hit| FactHit {
                 fact_id: hit.fact_id,
                 score: hit.score as f64,
             })
-            .collect()
+            .collect())
     }
 
     /// Search with an explicit method — see [`ToolRegistry::search_with_method`].
@@ -3050,10 +3066,11 @@ impl SkillRegistry {
     /// Lexical BM25 search over skills — see `ToolRegistry.search` for the
     /// contract (best-first, ties by id, infallible, traced as `"direct"`).
     #[napi]
-    pub fn search(&self, query: String, top_k: u32) -> Vec<SkillHit> {
-        self.inner
+    pub fn search(&self, query: String, top_k: u32) -> napi::Result<Vec<SkillHit>> {
+        Ok(self
+            .inner
             .read()
-            .expect("skill registry lock poisoned")
+            .map_err(|_| napi::Error::from_reason("skill registry lock poisoned"))?
             .search(&query, top_k as usize)
             .into_iter()
             .map(|hit| SkillHit {
@@ -3063,16 +3080,22 @@ impl SkillRegistry {
                 fused: hit.fused,
                 relevance: f64::from(hit.relevance),
             })
-            .collect()
+            .collect())
     }
 
     /// BM25 search with an explicit origin — see `ToolRegistry.searchWithOrigin`.
     #[napi]
-    pub fn search_with_origin(&self, query: String, top_k: u32, origin: String) -> Vec<SkillHit> {
+    pub fn search_with_origin(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+    ) -> napi::Result<Vec<SkillHit>> {
         let parsed = parse_origin(origin.as_str());
-        self.inner
+        Ok(self
+            .inner
             .read()
-            .expect("skill registry lock poisoned")
+            .map_err(|_| napi::Error::from_reason("skill registry lock poisoned"))?
             .search_with_origin(&query, top_k as usize, parsed)
             .into_iter()
             .map(|hit| SkillHit {
@@ -3082,7 +3105,7 @@ impl SkillRegistry {
                 fused: hit.fused,
                 relevance: f64::from(hit.relevance),
             })
-            .collect()
+            .collect())
     }
 
     /// Search with an explicit method — see [`ToolRegistry::search_with_method`].
@@ -3598,5 +3621,80 @@ mod tests {
         // Version skew between the SDK and the native must not break search.
         assert_eq!(parse_origin("from_the_future"), Origin::Direct);
         assert_eq!(parse_origin(""), Origin::Direct);
+    }
+
+    /// Poison a registry lock the way locks poison: panic while holding the
+    /// write guard. JS cannot get here (a panic inside a napi call aborts the
+    /// process first), so the sync search contract is pinned from Rust.
+    fn poison<T>(lock: &RwLock<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().unwrap();
+            panic!("poison the registry lock");
+        }));
+        assert!(lock.is_poisoned(), "precondition: poisoned");
+    }
+
+    // `napi::Error`'s `Drop` calls into Node-API, which a `cargo test` binary
+    // cannot link (napi is built without `dyn-symbols`), so these helpers never
+    // drop one: an error is read through `ManuallyDrop` and leaked.
+
+    fn ok<T>(result: napi::Result<T>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => {
+                let error = std::mem::ManuallyDrop::new(error);
+                panic!("unexpected error: {}", error.reason)
+            }
+        }
+    }
+
+    fn assert_poisoned_error<T>(result: napi::Result<T>, expected: &str) {
+        let result = std::mem::ManuallyDrop::new(result);
+        match &*result {
+            Ok(_) => panic!("a poisoned registry must refuse the search"),
+            Err(error) => assert_eq!(error.reason, expected),
+        }
+    }
+
+    #[test]
+    fn sync_tool_search_on_a_poisoned_registry_errors_rather_than_panicking() {
+        let registry = ok(ToolRegistry::new(None));
+        poison(&registry.inner);
+        assert_poisoned_error(
+            registry.search("read".into(), 5),
+            "tool registry lock poisoned",
+        );
+        assert_poisoned_error(
+            registry.search_with_origin("read".into(), 5, "agent".into()),
+            "tool registry lock poisoned",
+        );
+    }
+
+    #[test]
+    fn sync_skill_search_on_a_poisoned_registry_errors_rather_than_panicking() {
+        let registry = ok(SkillRegistry::new(None));
+        poison(&registry.inner);
+        assert_poisoned_error(
+            registry.search("read".into(), 5),
+            "skill registry lock poisoned",
+        );
+        assert_poisoned_error(
+            registry.search_with_origin("read".into(), 5, "agent".into()),
+            "skill registry lock poisoned",
+        );
+    }
+
+    #[test]
+    fn sync_fact_search_on_a_poisoned_registry_errors_rather_than_panicking() {
+        let registry = ok(FactRegistry::new(None));
+        poison(&registry.inner);
+        assert_poisoned_error(
+            registry.search("read".into(), 5),
+            "fact registry lock poisoned",
+        );
+        assert_poisoned_error(
+            registry.search_with_origin("read".into(), 5, "agent".into()),
+            "fact registry lock poisoned",
+        );
     }
 }
