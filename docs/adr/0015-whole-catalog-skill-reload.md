@@ -48,9 +48,11 @@ be a small change rather than an architecture:
   but `write_registry` also fails when any in-flight `search_async` still holds the read lock —
   including a plain BM25 one, which takes no dense permit. So an ordinary read can refuse a
   reload, non-deterministically, depending on whether the worker has taken the lock yet. This is
-  inherited, not introduced here: `register` contends the same way and did so before this ADR.
-  It is called out because the retry guidance below depends on it — a source must treat
-  `registry busy` as retryable on any traffic, not just dense traffic.
+  inherited, not introduced here. `register` used to contend the same way; it now waits for the
+  operations in flight instead, behind a per-registry gate in each SDK facade, while a reload
+  still refuses (as `RegistryBusyError`), also while a `register` is waiting, because its counts
+  are returned synchronously. It is called out because the retry guidance below depends on it —
+  a source must treat `registry busy` as retryable on any traffic, not just dense traffic.
 
 ## Decision
 

@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
+- `RegistryBusyError` (`code: "registry_busy"`), exported from the package root: what a synchronous mutation that cannot wait (`SkillCatalog.replaceAll`, `setTraceSink`, `experimentalEnableAdaptiveRanking`, ...) throws while an operation owns the registry. It extends `Error` and keeps the old message, so existing `catch` blocks and message checks keep working.
 - `ratelOpenAIDecisionPlugin({ url?, apiKeyEnv?, model? })` returns `{ retrieve, rerank }` for OpenAI's Decisions API (public beta; key in `OPENAI_API_KEY`, model `gpt-6-luna`). It ranks tools and skills like the Jev plugin, with the same limits, and adds the `RetrieverError` code `"Refused"` (transient) for a model refusal. The first plugin made prints a one-time beta warning (`RATEL_EXPERIMENTAL_SILENCE=1` silences it). It sends the query and each candidate's searchable text to OpenAI.
 
 ### Fixed
@@ -18,6 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **A rejected `experimentalEnableAdaptiveRanking` leaves `learn` untouched.** A re-enable refused as "registry busy" used to store its `learn` and usage policy anyway, so the next trace-sink install could start learning into a `learn: false` consumer graph
 - **Runtime events never carry the raw embedder fingerprint, endpoint URL or local model path.** `usage_ranking_status.model`, `usage_model_mismatch` and `embedder_model_mismatch` carry a redacted `name#hash` identity, and the `embedder_*` events carry the model's public name. Before, an endpoint URL with a query-string API key reached every event subscriber (core fix, surfaced through this SDK)
 - **BM25 matches words like `codebase` and `database` again** (core fix, surfaced through this SDK). Since 0.13.0-rc.5 a query was stemmed twice, so a word whose stem changes on a second pass never matched any tool or skill; 0.12.0 was unaffected.
+- **`register()` waits for operations in flight instead of failing with "registry busy".** On `ToolCatalog`, `SkillCatalog`, `FactCatalog` and the `ToolRegistry` / `SkillRegistry` / `FactRegistry` facades, a register made while a `searchAsync` (BM25 included), an embedding pass or an artifact build or warm is in flight on the same catalog now queues, applies once they settle, and resolves after its own dense preparation. An async search started while a register is waiting, or while a register embeds, runs after it, so it sees the new item and a stream of searches cannot starve the write. With nothing in flight the write still lands synchronously at the call, and a `retrieveFn` / `rerankerFn` in progress does not hold a register back. `SkillCatalog.replaceAll` still refuses, now with `RegistryBusyError`, also while a register is waiting.
 
 ## [0.13.0-rc.11] - 2026-10-05
 

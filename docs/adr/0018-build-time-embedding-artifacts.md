@@ -87,8 +87,9 @@ configured artifact source (path-backed config re-reads current bytes),
 re-warms against the whole current corpus, and applies the current miss policy.
 No resolve-once memoization, path-byte cache, or already-warmed flag.
 Artifact source resolution runs inside the SDK's registry-busy guard, so a
-corpus mutation racing an artifact warm is refused exactly as during any other
-dense operation.
+corpus mutation racing an artifact warm is handled exactly as during any other
+dense operation: a `register` waits for the warm, a synchronous mutation is
+refused.
 
 **TypeScript.** `experimentalBuildEmbeddingArtifact` builds BM25 metadata
 registries, embeds once per side, merges internally, and writes the file.

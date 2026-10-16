@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
+- `RegistryBusyError`, a `RuntimeError` exported from `ratel_ai` and `ratel_ai.exceptions`: what a synchronous mutation that cannot wait (`SkillCatalog.replace_all`, `set_trace_sink`, `experimental_enable_adaptive_ranking`, ...) raises while an operation owns the registry. It keeps the old message, so `except RuntimeError` and message checks keep working.
 - `ratel_openai_decision_plugin(url=None, api_key_env=None, model=None)` returns a `RetrieverPlugin` for OpenAI's Decisions API (public beta; key in `OPENAI_API_KEY`, model `gpt-6-luna`). It ranks tools and skills like the Jev plugin, with the same limits, and adds the `RetrieverError` code `"Refused"` (transient) for a model refusal. The first plugin made emits a one-time `ExperimentalWarning` (`RATEL_EXPERIMENTAL_SILENCE=1` silences it). It sends the query and each candidate's searchable text to OpenAI.
 
 ### Fixed
@@ -18,6 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **A trace sink or event subscriber attached after enable now receives `usage_ranking_status`.** The current status (with the last trigger's `reason`) is re-reported whenever one is installed while a graph is attached, so a consumer no longer has to subscribe before `experimental_enable_adaptive_ranking` to see it
 - **Runtime events never carry the raw embedder fingerprint, endpoint URL or local model path.** `usage_ranking_status.model`, `usage_model_mismatch` and `embedder_model_mismatch` carry a redacted `name#hash` identity, and the `embedder_*` events carry the model's public name. Before, an endpoint URL with a query-string API key reached every event subscriber (core fix, surfaced through this SDK)
 - **BM25 matches words like `codebase` and `database` again** (core fix, surfaced through this SDK). Since 0.13.0-rc.5 a query was stemmed twice, so a word whose stem changes on a second pass never matched any tool or skill; 0.12.0 was unaffected.
+- **`register()` waits for dense work in flight instead of raising "registry busy".** On `ToolCatalog`, `SkillCatalog`, `FactCatalog` and the three registries, a register made while a dense `search_async`, an embedding pass or an artifact build or warm is in flight on the same catalog on a running event loop takes its place in line at the call and returns a coroutine over a task already scheduled to wait for it (so `asyncio.create_task` and a `TaskGroup` accept it), then writes and prepares, so the write lands even if the call is never awaited; the wait works across threads and event loops, and a waiter whose loop stops does not hold up the others. A `search_async` (BM25 included) started after that call runs after the write, so it sees the new item. With nothing in flight the write still lands synchronously at the call; with no running event loop a contended register still raises, now `RegistryBusyError`. `SkillCatalog.replace_all` still refuses, now with `RegistryBusyError`, also while a register is waiting.
 
 ## [0.13.0-rc.11] - 2026-10-05
 
