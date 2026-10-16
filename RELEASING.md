@@ -231,12 +231,25 @@ therefore needs telemetry-py at **GA**, not at an RC.
 5. **(Optional dry-run, workflow-wired units only)** `workflow_dispatch` `release.yml` with
    the tag (e.g. `sdk-py-v0.2.1-rc.1`) and `dry_run: true` to validate the auth + publish path
    without consuming a version number.
-6. **Commit, tag, push:**
+6. **Open the release PR, merge it, then tag the merged commit.** `main` takes changes only
+   through a pull request (the ruleset requires one and a linear history; only the
+   `core-maintainers` bypass can push directly), and GitHub's squash and rebase merges both
+   write new commits. A tag pushed on the PR branch therefore points at a commit `main` never
+   contains. That is what happened to `sdk-ts-v0.13.0-rc.11` / `sdk-py-v0.13.0-rc.11`
+   (`0701f61`) and `core-v0.12.0-rc.6` (`42e7368`), and why `scripts/releasable.mjs` still
+   counts from the rc.10 / rc.5 tags. Tag after the merge instead:
    ```
+   git switch -c release/<unit>-vX.Y.Z
    git commit -am "release: <unit>-vX.Y.Z"
-   git tag <unit>-vX.Y.Z          # e.g. sdk-py-v0.2.1-rc.1
-   git push origin main <unit>-vX.Y.Z
+   git push -u origin HEAD                   # open the PR; merge it once ci-gate is green
+   git fetch origin
+   git log -1 --format='%h %s' origin/main   # must be the merged release commit
+   git tag <unit>-vX.Y.Z origin/main         # e.g. sdk-py-v0.2.1-rc.1
+   git push origin <unit>-vX.Y.Z
    ```
+   Several independent units can share one release PR (as `sdk-ts` and `sdk-py` often do):
+   tag the same merged commit once per unit. `tag-version-check` warns, without failing, when
+   the tagged commit is not on `main`.
 7. **Publish:** watch `release.yml` to completion and inspect the GitHub Release.
 8. **Verify the install:** run `verify-install.yml` for the unit + version
    (`gh workflow run verify-install.yml -f unit=$UNIT -f version=X.Y.Z`).

@@ -71,7 +71,7 @@ To cut a release — one unit at a time; see [RELEASING.md](RELEASING.md) for th
 1. `node scripts/releasable.mjs` to see which units have unreleased commits.
 2. Bump that unit's version in its manifest(s) — the release workflow validates the tag against every manifest the unit owns.
 3. Run the `/changelog` skill (`.claude/skills/changelog/`) for the unit. It drafts entries with [git-cliff](https://git-cliff.org), lets you curate, and writes the unit's CHANGELOG; for GA versions it collapses the unit's `## [X.Y.Z-rc.*]` sections into a single `## [X.Y.Z]`.
-4. Commit the bump + CHANGELOG together (`release: <unit>-vX.Y.Z`), tag `<unit>-vX.Y.Z`, push.
+4. Commit the bump + CHANGELOG together (`release: <unit>-vX.Y.Z`) on a branch and open a PR. Once it merges, tag the merged commit on `main` (`<unit>-vX.Y.Z`) and push the tag. A tag pushed on the PR branch lands on a commit `main` never contains, because squash and rebase merges rewrite it.
 
 The release workflow's `tag-version-check` job rejects any tag whose unit CHANGELOG lacks a `## [<version>]` heading. See [ADR 0008](docs/adr/0008-release-engineering.md) (per-unit versions, tags, and CHANGELOG gates) for the rationale.
 
