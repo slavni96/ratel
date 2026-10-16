@@ -90,6 +90,10 @@ jobs:
               - 'src/telemetry/conformance/**'
               - 'examples/**'
               - 'scripts/**'
+              # scripts/adr-index.test.mjs guards ADR numbering and the ADR index in
+              # docs/README.md, and the PR that breaks either usually touches docs alone.
+              - 'docs/adr/**'
+              - 'docs/README.md'
               - 'package.json'
               - 'pnpm-lock.yaml'
               - 'pnpm-workspace.yaml'

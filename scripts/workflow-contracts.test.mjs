@@ -66,6 +66,17 @@ test("ts path filter lists verify-install.yml", () => {
   assert.ok(ciWorkflow.slice(ts, next).includes("- '.github/workflows/verify-install.yml'"));
 });
 
+// adr-index.test.mjs runs in the `ts` job, and the PR that adds a duplicate ADR number
+// usually touches nothing but docs/adr/, so the filter has to see that path. It also reads
+// the ADR index in docs/README.md, so a PR that edits only the index must re-run it too.
+test("ts path filter lists docs/adr/** and docs/README.md", () => {
+  const ts = ciWorkflow.indexOf("\n            ts:");
+  const next = ciWorkflow.indexOf("\n            python:", ts);
+  const filter = ciWorkflow.slice(ts, next);
+  assert.ok(filter.includes("- 'docs/adr/**'"));
+  assert.ok(filter.includes("- 'docs/README.md'"));
+});
+
 function jobBody(workflow, job) {
   const start = workflow.indexOf(`\n  ${job}:`);
   assert.notEqual(start, -1, `missing ${job} job`);
