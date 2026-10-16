@@ -57,6 +57,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          # Full history, so the off-main warning below has origin/main to compare against.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -75,6 +77,40 @@ jobs:
           # and writes unit/version/dist_tag to $GITHUB_OUTPUT. Covered by
           # scripts/check-release-tag.test.mjs (run in the TS workflow).
           node scripts/check-release-tag.mjs "$tag"
+      # A warning, not a gate: blocking a release cut from a commit off main is a policy call
+      # for the maintainers. A tag pushed on a release PR's head before a squash or rebase
+      # merge points at a commit main never contains, so scripts/releasable.mjs keeps counting
+      # from the previous tag. RELEASING.md's flow tags the merged commit instead.
+      # A tag push checks out the tagged commit, but a dispatch checks out inputs.ref, which
+      # need not be the tag's commit, so the message names what was actually checked out.
+      - name: Warn when the tagged commit is not on main
+        continue-on-error: true
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          REF: ${{ inputs.ref }}
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          if [ "$EVENT" = "push" ]; then
+            subject="$TAG points at $sha"
+            title="Release tag not on main"
+            fix="Tag the merged commit on main instead (RELEASING.md, per-release flow)."
+          else
+            subject="Built ref ${REF:-main} ($sha) for $TAG"
+            title="Release ref not on main"
+            fix="Dispatch with a ref on main instead."
+          fi
+          if git merge-base --is-ancestor HEAD origin/main; then
+            echo "$subject: on main."
+          else
+            status=$?
+            if [ "$status" -eq 1 ]; then
+              echo "::warning title=$title::$subject: origin/main does not contain it. $fix"
+            else
+              echo "::warning title=Release commit not checked::Could not compare $sha with origin/main (git exit $status)."
+            fi
+          fi
 
   build:
     name: build (${{ matrix.triple }})

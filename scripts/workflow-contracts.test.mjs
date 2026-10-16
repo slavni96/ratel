@@ -47,6 +47,29 @@ test("publish-vercel-ai-sdk pins telemetry with the release caret on runtime and
   assert.ok(body.includes('npm view "@ratel-ai/telemetry@^${tele_ver}" version'));
 });
 
+// A tag pushed on a release PR's head before a squash or rebase merge lands on a commit main
+// never contains (sdk-ts-v0.13.0-rc.11, core-v0.12.0-rc.6). Warn on it; blocking is a policy
+// call for the maintainers, so the step must never fail the job.
+test("tag-version-check warns, without failing, when the tagged commit is not on main", () => {
+  const body = jobBody(releaseWorkflow, "tag-version-check");
+  assert.match(body, /fetch-depth: 0/, "full history, so origin/main is there to compare against");
+
+  const start = body.indexOf("- name: Warn when the tagged commit is not on main");
+  assert.notEqual(start, -1, "missing the off-main warning step");
+  const next = body.indexOf("\n      - ", start + 1);
+  const step = next === -1 ? body.slice(start) : body.slice(start, next);
+  assert.match(step, /continue-on-error: true/);
+  assert.match(step, /git merge-base --is-ancestor HEAD origin\/main/);
+  assert.match(step, /::warning/);
+  assert.doesNotMatch(step, /exit 1/);
+  // A dispatch checks out inputs.ref, not the tag's commit, so the message names the
+  // built ref there instead of saying the tag points at it.
+  assert.match(step, /EVENT: \$\{\{ github\.event_name \}\}/);
+  assert.match(step, /REF: \$\{\{ inputs\.ref \}\}/);
+  assert.match(step, /if \[ "\$EVENT" = "push" \]/);
+  assert.match(step, /Built ref \$\{REF:-main\} \(\$sha\)/);
+});
+
 test("publish-rc.sh restores adapter manifests with a git checkout EXIT trap", () => {
   assert.match(publishRc, /trap .*git .*checkout/);
 });
