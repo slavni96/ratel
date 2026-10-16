@@ -35,9 +35,11 @@ builder output for an empty artifact: `entry_count = 0`, `dim = 0`. Decoding
 does not newly reject an otherwise-valid empty RAT1 solely because
 `entry_count = 0` and `dim > 0`. Builders enforce the same vector semantic
 invariants before serialization. Header: `projection_version`, `dim`,
-`model_fingerprint`. Each entry: `kind` (Tool or Skill), stable `id`,
-`projection_hash` (SHA-256 of projection text — text never stored),
-L2-normalized vector. One RAT1 v1 file may mix Tool and Skill entries.
+`model_fingerprint`. `projection_version` is a manually bumped constant guarded
+by a golden test of the projected text, so it changes when that text changes
+and not when the projection source is merely edited. Each entry: `kind` (Tool
+or Skill), stable `id`, `projection_hash` (SHA-256 of projection text — text
+never stored), L2-normalized vector. One RAT1 v1 file may mix Tool and Skill entries.
 Unknown kind bytes are corrupt. Descriptions, bodies, executors, and credentials are not stored.
 
 **Local model identity (artifact vs runtime).** RAT1 header `model_fingerprint`

@@ -29,7 +29,7 @@ pub enum ArtifactEntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArtifactHeader {
     pub format_version: u32,
-    /// Hash-derived version of searchable-text projection logic at build time
+    /// [`PROJECTION_VERSION`] of the build that wrote the artifact
     pub projection_version: u32,
     /// Resolved embedder identity stamped on every vector in the artifact
     pub model_fingerprint: String,
@@ -211,21 +211,25 @@ impl From<EmbedderError> for ArtifactError {
     }
 }
 
-/// Hash of every catalog projection source — bumps when projection logic
-/// changes without a manual version constant.
-pub(crate) fn projection_version() -> u32 {
-    let mut h = Sha256::new();
-    h.update(include_str!("indexing.rs"));
-    h.update(include_str!("skill_indexing.rs"));
-    h.update(include_str!("fact_indexing.rs"));
-    u32::from_le_bytes(h.finalize()[..4].try_into().expect("4 bytes"))
-}
+/// Version of the searchable-text projection (`Embeddable::embed_text`, the text
+/// each entry's `projection_hash` digests), stamped in every RAT1 header and
+/// checked on warm and merge.
+///
+/// Bump it (increment by one) in the same commit as any change to the projected
+/// text, wherever that change lives; `projection_golden_tests` below fails until
+/// you do. A change that leaves the projected text alone (a comment, a test, a
+/// refactor) must not bump it: every artifact users already built would be
+/// rejected for nothing.
+///
+/// The value is what the former hash of the projection source files produced
+/// for every 0.13.0-rc build, kept so those artifacts keep warming.
+pub(crate) const PROJECTION_VERSION: u32 = 3_914_011_911;
 
 /// A valid RAT1 artifact with zero entries (no embedder required)
 pub(crate) fn build_empty_artifact() -> Result<Vec<u8>, ArtifactError> {
     let header = ArtifactHeader {
         format_version: SUPPORTED_FORMAT_VERSION,
-        projection_version: projection_version(),
+        projection_version: PROJECTION_VERSION,
         model_fingerprint: String::new(),
         dim: 0,
     };
@@ -299,7 +303,7 @@ pub(crate) fn build_artifact<'a, T: Embeddable + 'a>(
 
     let header = ArtifactHeader {
         format_version: SUPPORTED_FORMAT_VERSION,
-        projection_version: projection_version(),
+        projection_version: PROJECTION_VERSION,
         model_fingerprint,
         dim,
     };
@@ -969,7 +973,7 @@ mod tests {
         let (header, entries) = load_and_validate(&bytes).unwrap();
 
         assert_eq!(header.format_version, SUPPORTED_FORMAT_VERSION);
-        assert_eq!(header.projection_version, projection_version());
+        assert_eq!(header.projection_version, PROJECTION_VERSION);
         assert_eq!(
             header.model_fingerprint,
             "hf|repo=1:r|revision=4:main|pool=3:cls"
@@ -1086,7 +1090,7 @@ mod tests {
     #[test]
     fn structurally_corrupt_payload_with_valid_checksum_is_rejected() {
         let mut payload = Vec::new();
-        write_u32(&mut payload, projection_version());
+        write_u32(&mut payload, PROJECTION_VERSION);
         write_u32(&mut payload, 2);
         write_utf8(&mut payload, "fp", 0).unwrap();
         write_u32(&mut payload, 1);
@@ -1106,7 +1110,7 @@ mod tests {
     #[test]
     fn absurd_entry_count_with_valid_checksum_is_rejected_before_allocation() {
         let mut payload = Vec::new();
-        write_u32(&mut payload, projection_version());
+        write_u32(&mut payload, PROJECTION_VERSION);
         write_u32(&mut payload, 2);
         write_utf8(&mut payload, "fp", 0).unwrap();
         write_u32(&mut payload, u32::MAX);
@@ -1121,7 +1125,7 @@ mod tests {
     #[test]
     fn absurd_dim_with_valid_checksum_is_rejected_before_allocation() {
         let mut payload = Vec::new();
-        write_u32(&mut payload, projection_version());
+        write_u32(&mut payload, PROJECTION_VERSION);
         write_u32(&mut payload, u32::MAX);
         write_utf8(&mut payload, "fp", 0).unwrap();
         write_u32(&mut payload, 1);
@@ -1297,7 +1301,7 @@ mod tests {
     #[test]
     fn load_rejects_nonempty_zero_dim_with_valid_checksum() {
         let bytes = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             0,
             "fp-zero-dim",
             &[hand_entry("a", vec![])],
@@ -1332,7 +1336,7 @@ mod tests {
 
     #[test]
     fn empty_artifact_with_nonzero_dim_still_loads() {
-        let bytes = hand_artifact(projection_version(), 8, "fp-empty-nonzero-dim", &[]);
+        let bytes = hand_artifact(PROJECTION_VERSION, 8, "fp-empty-nonzero-dim", &[]);
         let (header, entries) = load_and_validate(&bytes).unwrap();
         assert!(entries.is_empty());
         assert_eq!(header.dim, 8);
@@ -1341,7 +1345,7 @@ mod tests {
     #[test]
     fn load_rejects_nan_vector_with_valid_checksum() {
         let bytes = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-nan",
             &[hand_entry("bad", vec![f32::NAN, 0.0])],
@@ -1356,7 +1360,7 @@ mod tests {
     #[test]
     fn load_rejects_pos_infinity_vector_with_valid_checksum() {
         let bytes = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-pinf",
             &[hand_entry("bad", vec![f32::INFINITY, 0.0])],
@@ -1371,7 +1375,7 @@ mod tests {
     #[test]
     fn load_rejects_neg_infinity_vector_with_valid_checksum() {
         let bytes = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-ninf",
             &[hand_entry("bad", vec![f32::NEG_INFINITY, 0.0])],
@@ -1386,7 +1390,7 @@ mod tests {
     #[test]
     fn load_rejects_non_unit_vector_with_valid_checksum() {
         let bytes = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-nonunit",
             &[hand_entry("bad", vec![3.0, 0.0])],
@@ -1401,7 +1405,7 @@ mod tests {
     #[test]
     fn load_accepts_unit_normalized_vector() {
         let bytes = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-unit",
             &[hand_entry("ok", unit([1.0, 0.0]))],
@@ -1424,7 +1428,7 @@ mod tests {
         let inside = vec![(1.0 + tol * 0.5).sqrt(), 0.0];
         assert!(is_unit_normalized(&inside));
         let bytes_ok = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-tol-in",
             &[hand_entry("ok", inside)],
@@ -1434,7 +1438,7 @@ mod tests {
         let outside = vec![(1.0 + tol * 2.0).sqrt(), 0.0];
         assert!(!is_unit_normalized(&outside));
         let bytes_bad = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-tol-out",
             &[hand_entry("bad", outside)],
@@ -1448,7 +1452,7 @@ mod tests {
     #[test]
     fn merge_rejects_checksum_valid_invalid_vector() {
         let bad = hand_artifact(
-            projection_version(),
+            PROJECTION_VERSION,
             2,
             "fp-merge-nan",
             &[hand_entry("bad", vec![f32::NAN, 0.0])],
@@ -1691,5 +1695,238 @@ mod tests {
             Err(ArtifactError::IncompatibleMerge { detail })
                 if detail.contains("projection_version")
         ));
+    }
+}
+
+/// Guards [`PROJECTION_VERSION`]: the projected text of a fixture that exercises
+/// the three `searchable_text` functions (tools, skills, facts), and the
+/// constant itself.
+#[cfg(test)]
+mod projection_golden_tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::PROJECTION_VERSION;
+    use crate::dense_cache::Embeddable;
+    use crate::fact::{Fact, PinMode};
+    use crate::skill::Skill;
+    use crate::tool::Tool;
+
+    /// The value [`PROJECTION_VERSION`] must hold. It moves with the golden below,
+    /// in the same commit, and never on its own.
+    const PINNED_PROJECTION_VERSION: u32 = 3_914_011_911;
+
+    /// `<kind> <id>: <embed_text()>` for each fixture item, in fixture order.
+    /// This is the exact text each artifact entry's `projection_hash` digests.
+    const PROJECTION_GOLDEN: &[&str] = &[
+        "tool tracker.create_issue: create_issue create issue Open an issue in the team tracker \
+         title one-line summary severity triage level low high assignee who owns the issue \
+         userId user Id directory id labels label_name label name bug feature",
+        "tool http.fetch_url: fetchUrl fetch Url Download a web page url absolute URL \
+         statusCode status Code HTTP status headers name",
+        "tool fs.delete_path: delete_path delete path remove a file or folder",
+        "skill frontend-slides: frontend-slides Build animation-rich HTML presentations \
+         frontend slide deck dark_mode dark mode",
+        "skill release-notes: release_notes release notes draft a changelog from merged pull \
+         requests changelog",
+        "skill untitled-skill: onboarding firstRun first Run",
+        "fact shop-address: shop_address shop address Where the shop is and when it opens \
+         location openingHours opening Hours",
+        "fact return-policy: returnPolicy return Policy how long a customer has to send an \
+         order back refunds",
+        "fact unnamed-fact: support_hours support hours",
+    ];
+
+    const BUMP_HINT: &str = "the searchable-text projection changed, so every RAT1 artifact \
+        built before this change holds vectors for text this build no longer produces: bump \
+        PROJECTION_VERSION in src/core/src/embedding_artifact.rs (increment it by one), then \
+        update PROJECTION_GOLDEN and PINNED_PROJECTION_VERSION in this module in the same commit";
+
+    fn tools() -> Vec<Tool> {
+        vec![
+            // Nested object properties, property descriptions, enum values (a
+            // non-string one is skipped), and an array of objects via `items`.
+            Tool {
+                id: "tracker.create_issue".into(),
+                name: "create_issue".into(),
+                description: "Open an issue in the team tracker".into(),
+                experimental_searchable_description: None,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "one-line summary" },
+                        "severity": {
+                            "type": "string",
+                            "description": "triage level",
+                            "enum": ["low", "high", 3]
+                        },
+                        "assignee": {
+                            "type": "object",
+                            "description": "who owns the issue",
+                            "properties": {
+                                "userId": { "type": "string", "description": "directory id" }
+                            }
+                        },
+                        "labels": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label_name": { "type": "string", "enum": ["bug", "feature"] }
+                                }
+                            }
+                        }
+                    },
+                    "required": ["title"]
+                }),
+                output_schema: json!({}),
+            },
+            // An output schema, and a camelCase name.
+            Tool {
+                id: "http.fetch_url".into(),
+                name: "fetchUrl".into(),
+                description: "Download a web page".into(),
+                experimental_searchable_description: None,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "absolute URL" }
+                    }
+                }),
+                output_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "statusCode": { "type": "integer", "description": "HTTP status" },
+                        "headers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": { "name": { "type": "string" } }
+                            }
+                        }
+                    }
+                }),
+            },
+            // The experimental override replaces the description and drops the schemas.
+            Tool {
+                id: "fs.delete_path".into(),
+                name: "delete_path".into(),
+                description: "Model-facing text the override replaces".into(),
+                experimental_searchable_description: Some("remove a file or folder".into()),
+                input_schema: json!({
+                    "properties": { "path": { "description": "never indexed" } }
+                }),
+                output_schema: json!({}),
+            },
+        ]
+    }
+
+    fn skills() -> Vec<Skill> {
+        vec![
+            // Tags (an empty one is skipped) and tool references, metadata and a
+            // body, none of which reach the projection.
+            Skill {
+                id: "frontend-slides".into(),
+                name: "frontend-slides".into(),
+                description: "Build animation-rich HTML presentations".into(),
+                experimental_searchable_description: None,
+                tags: vec![
+                    "frontend".into(),
+                    "slide deck".into(),
+                    String::new(),
+                    "dark_mode".into(),
+                ],
+                tools: vec!["fs__write_file".into(), "browser__open".into()],
+                metadata: HashMap::from([("stacks".into(), vec!["react".into()])]),
+                body: "# Frontend Slides\n\nThe body is the payload, never indexed.".into(),
+            },
+            // The experimental override replaces the description; tags stay.
+            Skill {
+                id: "release-notes".into(),
+                name: "release_notes".into(),
+                description: "Model-facing text the override replaces".into(),
+                experimental_searchable_description: Some(
+                    "draft a changelog from merged pull requests".into(),
+                ),
+                tags: vec!["changelog".into()],
+                tools: Vec::new(),
+                metadata: HashMap::new(),
+                body: String::new(),
+            },
+            // An empty name and an empty description push nothing; tags remain.
+            Skill {
+                id: "untitled-skill".into(),
+                name: String::new(),
+                description: String::new(),
+                experimental_searchable_description: None,
+                tags: vec!["onboarding".into(), "firstRun".into()],
+                tools: Vec::new(),
+                metadata: HashMap::new(),
+                body: String::new(),
+            },
+        ]
+    }
+
+    fn facts() -> Vec<Fact> {
+        vec![
+            Fact {
+                id: "shop-address".into(),
+                name: "shop_address".into(),
+                description: "Where the shop is and when it opens".into(),
+                experimental_searchable_description: None,
+                tags: vec!["location".into(), "openingHours".into()],
+                metadata: HashMap::new(),
+                body: "12 Baker Street, never indexed".into(),
+                pin: PinMode::Always,
+            },
+            // The experimental override replaces the description; tags stay.
+            Fact {
+                id: "return-policy".into(),
+                name: "returnPolicy".into(),
+                description: "Model-facing text the override replaces".into(),
+                experimental_searchable_description: Some(
+                    "how long a customer has to send an order back".into(),
+                ),
+                tags: vec!["refunds".into()],
+                metadata: HashMap::new(),
+                body: "30 days, never indexed".into(),
+                pin: PinMode::Retrieved,
+            },
+            // An empty name pushes nothing, and an empty override empties the
+            // description rather than falling back to it; tags remain.
+            Fact {
+                id: "unnamed-fact".into(),
+                name: String::new(),
+                description: "Dropped by the empty override".into(),
+                experimental_searchable_description: Some(String::new()),
+                tags: vec!["support_hours".into()],
+                metadata: HashMap::new(),
+                body: "9 to 5, never indexed".into(),
+                pin: PinMode::Retrieved,
+            },
+        ]
+    }
+
+    fn line(kind: &str, item: &dyn Embeddable) -> String {
+        format!("{kind} {}: {}", item.embed_id(), item.embed_text())
+    }
+
+    #[test]
+    fn projected_text_matches_the_golden() {
+        let mut actual: Vec<String> = tools().iter().map(|t| line("tool", t)).collect();
+        actual.extend(skills().iter().map(|s| line("skill", s)));
+        actual.extend(facts().iter().map(|f| line("fact", f)));
+        assert_eq!(actual, PROJECTION_GOLDEN, "{BUMP_HINT}");
+    }
+
+    #[test]
+    fn projection_version_moves_only_with_the_golden() {
+        assert_eq!(
+            PROJECTION_VERSION, PINNED_PROJECTION_VERSION,
+            "PROJECTION_VERSION changed but the golden did not: bump it only when the \
+             projected text changes, together with PROJECTION_GOLDEN and \
+             PINNED_PROJECTION_VERSION in this module"
+        );
     }
 }

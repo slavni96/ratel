@@ -35,8 +35,9 @@ are not indexed by either BM25 or dense retrieval. A tool without an override re
 stable schema-inclusive projection; skills and facts continue to use their authored description.
 
 The private per-catalog `searchable_text()` functions remain the single projection seam used by
-BM25 documents and `Embeddable::embed_text`. The artifact `projection_version` hashes all three
-projection source files, while each cached entry keeps a SHA-256 hash of its projected text.
+BM25 documents and `Embeddable::embed_text`. The artifact `projection_version` covers all three
+projections (a constant bumped when their output changes, see ADR-0018), while each cached entry
+keeps a SHA-256 hash of its projected text.
 Consequently, an override edit is catalog churn and invalidates that entry when its effective
 projection changes; byte-identical entries retain their vectors.
 

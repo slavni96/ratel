@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - `JevError` is now an alias of `RankerError`, so it gains the `Refused` variant (additive: the enum is `#[non_exhaustive]`). Its `Display` names no service ("decision model config: …" instead of "jev config: …"); `describe("jev")` gives the old wording. `CandidateKind` moved to the shared module but is still exported from the crate root
 - `TraceEvent::UsageRankingStatus`'s `status` and `reason` are typed enums, `UsageRankingState` (`active`/`inactive`/`unknown`/`paused`) and `UsageRankingReason` (`enabled`/`disabled`/`rebuilt`), instead of free strings. The wire values are unchanged; a value outside the contract no longer deserializes. Rust code constructing the variant must use the enums
+- The embedding artifact's projection version (the RAT1 header's `projection_version`) is a constant, bumped by hand only when the projected searchable text changes, instead of a hash of the three projection source files. Before, a comment or test edit in those files rejected every pre-built artifact with `WarmError::ArtifactProjectionMismatch` (and stopped parts from merging), while a projection change made in another file left the version unchanged. The constant keeps today's value, 3914011911, so artifacts built by 0.11.0 and later, the SDKs' 0.13.0 RC line included, still warm. A golden test of the projected text now fails, with a bump instruction, when that text changes
 
 ### Fixed
 

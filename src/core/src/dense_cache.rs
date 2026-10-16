@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::dense_search::dense_search;
 use crate::embedding::{Embedder, EmbedderError, embedder_with_telemetry};
 use crate::embedding_artifact::{
-    ArtifactEntry, ArtifactEntryKind, ArtifactError, build_empty_artifact, hash_projection_text,
-    load_and_validate, projection_version,
+    ArtifactEntry, ArtifactEntryKind, ArtifactError, PROJECTION_VERSION, build_empty_artifact,
+    hash_projection_text, load_and_validate,
 };
 use crate::embedding_config::{EmbeddingModel, public_model_identity};
 use crate::trace::{TraceEvent, TraceSink};
@@ -64,7 +64,7 @@ pub enum WarmError {
     ArtifactProjectionMismatch {
         /// Projection version recorded in the RAT1 header.
         artifact: u32,
-        /// Projection version this build computes.
+        /// Projection version this build uses.
         active: u32,
     },
     /// Embedder load, identity probe, or dimension check failed during warm.
@@ -303,11 +303,10 @@ impl DenseCache {
         // Checked before anything else: a projection change makes every entry
         // stale, and the per-entry hash below would report that as an
         // indistinguishable pile of misses rather than as a cause.
-        let active_projection = projection_version();
-        if header.projection_version != active_projection {
+        if header.projection_version != PROJECTION_VERSION {
             return Err(WarmError::ArtifactProjectionMismatch {
                 artifact: header.projection_version,
-                active: active_projection,
+                active: PROJECTION_VERSION,
             });
         }
         // Known other kinds are ignored so one mixed RAT1 can warm either registry.
@@ -1371,6 +1370,33 @@ mod tests {
     }
 
     #[test]
+    fn an_artifact_stamped_by_the_source_hash_projection_version_still_warms() {
+        // Until the projection version became a constant, the header carried the
+        // first four bytes of a SHA-256 over the projection source files, which
+        // was 3_914_011_911 for every 0.13.0-rc build. The constant kept that
+        // value so artifacts users built then keep warming. The first deliberate
+        // projection bump makes them stale by design: delete this test with it.
+        let items = [doc("a", "read")];
+        let bytes = crate::embedding_artifact::test_hand_artifact(
+            3_914_011_911,
+            2,
+            "fp-rc",
+            &[ArtifactEntry {
+                kind: ArtifactEntryKind::Tool,
+                id: "a".into(),
+                projection_hash: hash_projection_text("read"),
+                vector: unit([1.0, 0.0]),
+            }],
+        );
+        let cache = DenseCache::with_embedder(Arc::new(PanicOnEmbedStub::new("fp-rc")));
+        let outcome = cache
+            .warm_from_artifact(&bytes, ArtifactEntryKind::Tool, &items, &NoopSink)
+            .expect("an artifact from the source-hash era warms");
+        assert_eq!(outcome.reused, vec!["a"]);
+        assert!(outcome.missing.is_empty());
+    }
+
+    #[test]
     fn a_stale_projection_is_named_rather_than_reported_as_a_pile_of_misses() {
         // Without the header check every entry fails the per-entry projection
         // hash, and the miss policy either reports the whole catalog missing for
@@ -1435,7 +1461,7 @@ mod tests {
     fn warm_rejects_nonempty_zero_dim_before_cache_mutation() {
         let items = [doc("a", "read")];
         let bytes = crate::embedding_artifact::test_hand_artifact(
-            crate::embedding_artifact::projection_version(),
+            crate::embedding_artifact::PROJECTION_VERSION,
             0,
             "fp-zero-dim",
             &[ArtifactEntry {
