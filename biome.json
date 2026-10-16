@@ -10,9 +10,7 @@
       "src/adapters/**/*.js",
       "src/telemetry/**/*.ts",
       "src/telemetry/**/*.tsx",
-      "src/telemetry/**/*.js",
-      "benchmark/agent/src/**/*.ts",
-      "benchmark/agent/src/**/*.tsx"
+      "src/telemetry/**/*.js"
     ]
   },
   "formatter": {
