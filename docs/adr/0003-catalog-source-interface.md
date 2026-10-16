@@ -17,6 +17,13 @@ pull from optional upward runtime facts and source-scoped catalog snapshot publi
 Amended 2026-08-15 to cut catalog protocol v2 with an optional searchable-description override
 and a new frozen ETag projection while leaving v1 unchanged.
 
+Amended 2026-10-16: the source seam is decided, not built. Neither SDK has a source loader or
+reads `RATEL_URL` as a catalog source; catalogs fill only from in-process registration. The only
+reader of `RATEL_URL` in this repo is the Python telemetry helper (behind the Python SDK's
+`configure_telemetry`), as a deprecated fallback for the OTLP endpoint. The `@ratel-ai/cloud` (npm) and `ratel-ai-cloud` (PyPI) loaders named below are not
+on either registry; Ratel Cloud's published client, `@ratel-ai/cloud-sdk`, does not load
+catalogs into an agent.
+
 ## Context
 
 An earlier plan scheduled a standalone `ratel-ai-server` binary as the rung between the

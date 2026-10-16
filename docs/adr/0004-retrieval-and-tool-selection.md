@@ -8,6 +8,10 @@ Accepted
 
 Extended experimentally by [ADR-0021](0021-catalog-searchable-description-projections.md).
 
+Amended 2026-10-16: `suggest` is decided but not implemented, so `replace` is the only mode
+that ships; hybrid fuses on scores per [ADR-0024](0024-hybrid-fuses-on-scores.md); `k1`/`b`
+have an experimental override.
+
 Compacted 2026-07 from pre-compaction ADR-0003 (tool selection, 2026-04-30) and ADR-0004
 (tool indexing, 2026-04-30).
 
@@ -43,10 +47,10 @@ The scorers over that projection are selectable while the projection stays stabl
   descriptions are short: term frequency saturates faster and length normalization matters
   less).
 - Semantic retrieval embeds the same projection with a configurable in-process model or
-  OpenAI-compatible endpoint; hybrid retrieval merges its ranking with BM25 through reciprocal
-  rank fusion. See ADR-0011 and ADR-0012 for retrieval, cache, and async SDK semantics. The
-  `searchable_text` contract above stays stable across scorer changes; rankers and their
-  parameters are current tuning, not a frozen surface.
+  OpenAI-compatible endpoint; hybrid retrieval fuses its normalised score with BM25's
+  ([ADR-0024](0024-hybrid-fuses-on-scores.md)). See ADR-0011 and ADR-0012 for retrieval, cache,
+  and async SDK semantics. The `searchable_text` contract above stays stable across scorer
+  changes; rankers and their parameters are current tuning, not a frozen surface.
 
 ### Selection
 
@@ -54,16 +58,20 @@ The scorers over that projection are selectable while the projection stays stabl
   replaces it with the ranked top-K. The token reduction is direct and attributable.
 - **`suggest` is opt-in**: a ranked subset emitted alongside the existing tool list, for
   frameworks that own the list and offer no replace seam.
-- Both modes are a configurable enum on the public API; each framework integration wires the
-  chosen mode to the framework's actual tool-injection point.
+- **Only `replace` ships.** The SDKs and adapters put the `search_capabilities` /
+  `invoke_tool` funnel, optionally with a ranked top-K pre-filter, in the model's tool list in
+  place of the full catalog. `suggest` is decided but not implemented: no SDK or adapter
+  exposes a mode setting. When it lands, the mode is a configurable enum on the public API,
+  and each framework integration wires it to that framework's actual tool-injection point.
 
 ## Consequences
 
 - The tool author's vocabulary (description, parameter names, enum values) flows directly
   into recall: documentation quality is the retrieval lever, and the integrator's knob.
-- The current `k1`/`b` are fixed tuning, reproducible for today's benchmarks; they are not a
-  public knob. Revisiting them or any dense-ranking detail does not disturb the
-  `searchable_text` contract.
+- The current `k1`/`b` are fixed defaults, reproducible for today's benchmarks; the only
+  override is experimental (`experimentalBm25` in TypeScript, `experimental_bm25_k1` /
+  `experimental_bm25_b` in Python). Revisiting them or any dense-ranking detail does not disturb
+  the `searchable_text` contract.
 - Rejected: rolling our own lexical scorer (maintenance, no gain at this scope); indexing raw
   JSON (flattens term distribution, hurts IDF); a typed schema struct instead of `Value`
   (locks the public `Tool` shape at every framework boundary); `suggest` as default (ranking
