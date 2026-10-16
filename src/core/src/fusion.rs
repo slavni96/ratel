@@ -7,6 +7,8 @@
 //! *rank position*. Pure Rust, no heavy deps — its tests run on every build
 //! without a model download.
 
+use crate::score::cmp_desc;
+
 /// RRF damping constant. 60 is the Cormack et al. (2009) default and the field
 /// standard; large enough that the reciprocal curve is gentle past the head of
 /// each list, small enough that top ranks still dominate.
@@ -57,11 +59,7 @@ pub(crate) fn rrf_fuse_weighted(lists: &[WeightedArm<'_>], k: f32) -> Vec<(Strin
 /// the full set before the cut keeps top-K *membership* stable when a tie
 /// straddles the boundary — see the rationale in [`crate::search::Bm25Index::search`].
 pub(crate) fn sort_and_truncate(ranked: &mut Vec<(String, f32)>, top_k: usize) {
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    ranked.sort_by(|a, b| cmp_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0)));
     ranked.truncate(top_k);
 }
 
@@ -585,6 +583,38 @@ mod tests {
         assert_eq!(
             ranked.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "mid"]
+        );
+    }
+
+    #[test]
+    fn sort_and_truncate_puts_a_nan_score_after_every_real_one() {
+        let mut ranked = vec![
+            ("a".to_string(), f32::NAN),
+            ("b".to_string(), 0.1),
+            ("c".to_string(), f32::NEG_INFINITY),
+            ("d".to_string(), 0.9),
+        ];
+        sort_and_truncate(&mut ranked, 4);
+        assert_eq!(
+            ranked.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["d", "b", "c", "a"]
+        );
+    }
+
+    #[test]
+    fn score_fusion_ranks_a_nan_from_either_arm_last() {
+        // `clamp` keeps a NaN, so a NaN BM25 or cosine score makes the fused
+        // score NaN. Both must land after every real candidate, NaNs by id.
+        let bm25 = vec![("a".to_string(), f32::NAN), ("c".to_string(), 2.0)];
+        let dense = vec![
+            ("b".to_string(), f32::NAN),
+            ("c".to_string(), 0.5),
+            ("d".to_string(), 0.1),
+        ];
+        let fused = score_fuse(&bm25, 4.0, &dense, None, DenseWeight::default());
+        assert_eq!(
+            fused.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "d", "a", "b"]
         );
     }
 }

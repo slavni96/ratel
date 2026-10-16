@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use crate::embedding::EmbedderError;
 use crate::method::SearchMethod;
+use crate::score::cmp_desc;
 use crate::trace::{SearchStage, TraceEventContext};
 
 /// A second-stage ranker over the first stage's top `depth` candidates.
@@ -204,11 +205,7 @@ pub(crate) fn order_by_rescore(scored: &mut [(String, f32)], stage_one: &[String
         .map(|(i, id)| (id.as_str(), i))
         .collect();
     let pos = |id: &str| position.get(id).copied().unwrap_or(usize::MAX);
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| pos(&a.0).cmp(&pos(&b.0)))
-    });
+    scored.sort_by(|a, b| cmp_desc(a.1, b.1).then_with(|| pos(&a.0).cmp(&pos(&b.0))));
 }
 
 /// Clean a caller-supplied ranking: ids `known` accepts, each once (the first
@@ -238,7 +235,7 @@ pub(crate) fn order_retrieved(
     top_k: usize,
 ) -> Vec<(String, f32)> {
     let mut ranked = sanitize(ranked, known);
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| cmp_desc(a.1, b.1));
     ranked.truncate(top_k);
     ranked
 }
@@ -343,6 +340,24 @@ mod tests {
         let stage_one = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
         let got = order_reranked(pairs(&[("s3", 0.8), ("outsider", 1.0)]), &stage_one, 3);
         assert_eq!(ids(&got), vec!["s3", "s1", "s2"]);
+        assert_eq!(got[1].1, 0.0);
+    }
+
+    #[test]
+    fn a_nan_rescore_ranks_after_every_real_one() {
+        // A built-in reranker's NaN score (a degenerate embedding) used to tie
+        // with everything and keep its stage-1 lead.
+        let stage_one = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let mut scored = pairs(&[("x", f32::NAN), ("y", 0.5), ("z", 0.9)]);
+        order_by_rescore(&mut scored, &stage_one);
+        assert_eq!(ids(&scored), vec!["z", "y", "x"]);
+    }
+
+    #[test]
+    fn reranked_reads_a_nan_score_as_zero_after_every_real_one() {
+        let stage_one = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
+        let got = order_reranked(pairs(&[("s1", f32::NAN), ("s2", 0.3)]), &stage_one, 3);
+        assert_eq!(ids(&got), vec!["s2", "s1", "s3"]);
         assert_eq!(got[1].1, 0.0);
     }
 

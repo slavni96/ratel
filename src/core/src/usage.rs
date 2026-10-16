@@ -35,6 +35,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::fusion::sort_and_truncate;
+use crate::score::cmp_asc;
 
 /// Fraction of the usage arm's full weight granted per unit of support, capped
 /// at 1.0 once `SUPPORT_FULL` observations agree. One confirmed observation
@@ -1930,9 +1931,7 @@ impl IntentGraph {
             .map(|(i, it)| (i, it.lexical_score(&q)))
             .filter(|(_, score)| *score >= TAU_LEXICAL)
             .max_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| self.intents[b.0].id.cmp(&self.intents[a.0].id))
+                cmp_asc(a.1, b.1).then_with(|| self.intents[b.0].id.cmp(&self.intents[a.0].id))
             })
             .map(|(i, _)| i)
     }
@@ -1978,11 +1977,7 @@ impl IntentGraph {
                 };
                 (*m, score)
             })
-            .max_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.0.cmp(a.0))
-            })
+            .max_by(|a, b| cmp_asc(a.1, b.1).then_with(|| b.0.cmp(a.0)))
             .map(|(m, _)| m.clone())
             .unwrap_or_default()
     }
@@ -2202,9 +2197,7 @@ impl IntentGraph {
 /// iteration order. (`max_by` keeps the last maximum, so the comparison is
 /// reversed on id to leave the alphabetically-first winner in place.)
 fn pick_best(a: &(&Intent, f32), b: &(&Intent, f32)) -> std::cmp::Ordering {
-    a.1.partial_cmp(&b.1)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| b.0.id.cmp(&a.0.id))
+    cmp_asc(a.1, b.1).then_with(|| b.0.id.cmp(&a.0.id))
 }
 
 fn arm_from(
@@ -2381,16 +2374,8 @@ pub(crate) fn dense_verdict(
 fn rank_verdicts(a: &DenseVerdict, b: &DenseVerdict) -> std::cmp::Ordering {
     a.covered
         .cmp(&b.covered)
-        .then_with(|| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .then_with(|| {
-            a.mean_cos
-                .partial_cmp(&b.mean_cos)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .then_with(|| cmp_asc(a.score, b.score))
+        .then_with(|| cmp_asc(a.mean_cos, b.mean_cos))
 }
 
 /// L2 norm. For an accumulator of unit vectors this doubles as the cluster's
@@ -5355,5 +5340,39 @@ mod tests {
         let last = format!("turn-{}", PENDING_CAP + 9);
         assert!(g.pending.vector_for(Some(&last), "some query").is_some());
         assert!(g.claim_credit(Some(&last), "some query"));
+    }
+
+    // ---- a NaN score never wins a cluster pick ------------------------------
+
+    #[test]
+    fn a_nan_verdict_ranks_below_a_real_one() {
+        // A member vector carrying a NaN makes `mean_cos` NaN while the cluster
+        // can still be admitted. It used to tie, handing the pick to the id.
+        let verdict = |score: f32, mean_cos: f32| DenseVerdict {
+            admitted: true,
+            covered: true,
+            score,
+            mean_cos,
+            centroid_cos: 0.9,
+        };
+        let real = verdict(0.5, 0.8);
+        for nan in [verdict(f32::NAN, 0.8), verdict(0.5, f32::NAN)] {
+            assert_eq!(rank_verdicts(&nan, &real), std::cmp::Ordering::Less);
+            assert_eq!(rank_verdicts(&real, &nan), std::cmp::Ordering::Greater);
+        }
+    }
+
+    #[test]
+    fn a_nan_lexical_score_is_never_the_best_cluster() {
+        // "a" wins every tie on id, so only the score can keep it from winning.
+        let a = intent("a", &["x"], &[]);
+        let b = intent("b", &["y"], &[]);
+        for pair in [[(&a, f32::NAN), (&b, 0.6)], [(&b, 0.6), (&a, f32::NAN)]] {
+            let best = pair
+                .into_iter()
+                .max_by(pick_best)
+                .map(|(it, _)| it.id.clone());
+            assert_eq!(best.as_deref(), Some("b"));
+        }
     }
 }

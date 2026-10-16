@@ -6,6 +6,8 @@
 //! best score first, ties broken by `id` — so top-K membership is stable across
 //! processes regardless of input order.
 
+use crate::score::cmp_desc;
+
 /// Rank `(id, vector)` documents against `query_vec` by cosine similarity and
 /// return the top-`top_k` as `(id, score)`, best-first with ties broken by `id`.
 ///
@@ -22,11 +24,7 @@ where
         .into_iter()
         .map(|(id, vec)| (id, cosine(vec, query_vec)))
         .collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    ranked.sort_by(|a, b| cmp_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0)));
     ranked.truncate(top_k);
     ranked
 }
@@ -61,6 +59,20 @@ mod tests {
         ];
         let hits = dense_search(refs(&docs), &[1.0, 0.0], 5);
         assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("read"));
+    }
+
+    #[test]
+    fn a_nan_score_ranks_after_every_real_one() {
+        // A vector carrying a NaN (a degenerate embedding) scores NaN. Under the
+        // old comparator it tied with everything and took the top on its id.
+        let docs = vec![
+            ("a_nan".to_string(), vec![f32::NAN, 0.0]),
+            ("b".to_string(), vec![0.0, 1.0]),
+            ("c".to_string(), vec![1.0, 0.0]),
+        ];
+        let hits = dense_search(refs(&docs), &[1.0, 0.0], 5);
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["c", "b", "a_nan"]);
     }
 
     #[test]

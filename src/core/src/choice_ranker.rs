@@ -14,6 +14,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::rerank::RankCandidate as Candidate;
+use crate::score::cmp_desc;
 
 /// Options per question. Jev and OpenAI both accept 2 to 255; 150 keeps each
 /// question well inside Jev's token budget, and OpenAI gets the same.
@@ -558,11 +559,7 @@ pub(crate) fn from_probabilities(
             None => Some((i, 0.0)),
         })
         .collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+    ranked.sort_by(|a, b| cmp_desc(a.1, b.1).then(a.0.cmp(&b.0)));
     ranked
         .into_iter()
         .map(|(i, p)| (candidates[i].id.clone(), p))
@@ -670,6 +667,25 @@ mod tests {
         let refs: Vec<&Candidate> = many.iter().collect();
         assert!(!fits_one_question(&refs), "60 × 2,000 chars exceeds 80,000");
         assert_eq!(split_into_questions(&refs).len(), 2);
+    }
+
+    #[test]
+    fn a_nan_probability_is_dropped_and_the_rest_rank_best_first() {
+        let field: Vec<Candidate> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| Candidate {
+                id: (*id).into(),
+                text: "y".into(),
+            })
+            .collect();
+        let refs: Vec<&Candidate> = field.iter().collect();
+        let probs: HashMap<String, f32> = [("t0", f32::NAN), ("t1", 0.4), ("t2", 0.9)]
+            .into_iter()
+            .map(|(k, p)| (k.to_string(), p))
+            .collect();
+        let ranked = from_probabilities(&probs, &refs);
+        let ids: Vec<&str> = ranked.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "d"]);
     }
 
     #[test]

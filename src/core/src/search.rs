@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use bm25::{DefaultTokenizer, Document, Language, SearchEngine, SearchEngineBuilder, Tokenizer};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::score::cmp_desc;
+
 /// Shipped `k1`, unless a caller overrides it via [`Bm25Params`].
 ///
 /// Below the crate default because tool text is short, so a term repeating
@@ -275,11 +277,7 @@ impl Bm25Index {
             .into_iter()
             .map(|r| (r.document.id, r.score))
             .collect();
-        ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        ranked.sort_by(|a, b| cmp_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(top_k);
         ranked
     }

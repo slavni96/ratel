@@ -107,6 +107,7 @@ mod jev;
 mod method;
 mod openai_decision;
 mod rerank;
+mod score;
 mod search;
 mod skill;
 mod skill_indexing;
