@@ -14,7 +14,7 @@ import {
   type SkillHit,
   type Tool,
 } from "../native/index.cjs";
-import { assertNotArtifactBusy } from "./artifact-source-warm.js";
+import { assertNotArtifactBusy, warmFromEmbeddingArtifactSource } from "./artifact-source-warm.js";
 import {
   type EmbeddingSpec,
   type ExperimentalBm25Params,
@@ -28,13 +28,37 @@ import {
   usesDense,
 } from "./catalog.js";
 import { customRerank, customSearch } from "./custom-ranking.js";
-import { mapArtifactBuildError, mapArtifactWarmError, mapEmbedderError } from "./errors.js";
+import {
+  mapArtifactBuildError,
+  mapArtifactWarmError,
+  mapEmbedderError,
+  mapRegistryBusyError,
+} from "./errors.js";
 import { assertValidFact, type Fact } from "./grounding.js";
+import { OperationGate } from "./operation-gate.js";
 import type { RuntimeEvent, RuntimeEventsOptions } from "./runtime-events.js";
 import { type RuntimeEventProjection, recordCatalogDefinitions } from "./telemetry.js";
 import { withTurnContext } from "./turn.js";
 
 export { IntentGraph };
+
+/**
+ * Resolves a catalog's configured embedding artifact to the bytes to warm
+ * from and the miss policy. @internal
+ */
+export type ArtifactResolver = () => Promise<{ bytes: Buffer; onMiss: "error" | "embed" }>;
+
+/**
+ * Run a synchronous native mutation, re-raising its "registry busy" refusal as
+ * a typed {@link RegistryBusyError}.
+ */
+function nativeWrite<T>(call: () => T): T {
+  try {
+    return call();
+  } catch (error) {
+    throw mapRegistryBusyError(error);
+  }
+}
 
 /** One registry's `learn` for a graph, held weakly so a catalog dropped without
  * disable can still be collected. */
@@ -191,6 +215,8 @@ export class ToolRegistry {
   private readonly eager: boolean;
   private readonly emittedDefinitionHashes = new Map<string, string>();
   private useDefinitionOverrides = false;
+  /** Admits this registry's async operations; see {@link OperationGate}. */
+  readonly #gate = new OperationGate();
 
   /**
    * Create a registry with an optional embedding model and retrieval method.
@@ -233,11 +259,58 @@ export class ToolRegistry {
    * errors here. A `"bm25"` registry resolves as soon as metadata is indexed
    * and never loads a model.
    *
+   * With nothing in flight, metadata is indexed synchronously, at the call.
+   * While an asynchronous operation on this registry is in flight (a
+   * `searchWithMethodAsync`, an embedding pass, an artifact build), the
+   * write waits for it to settle instead of failing with "registry busy", and
+   * the promise resolves once the write and its embedding are done. An async
+   * operation started while a register is waiting runs after it.
+   *
    * @param item - A single {@link Tool} or a readonly array of them.
    */
-  async register(item: Tool | readonly Tool[]): Promise<void> {
-    this.registerItems(item);
-    await this.buildDense();
+  register(item: Tool | readonly Tool[]): Promise<void> {
+    const items = Array.isArray(item) ? [...item] : [item];
+    return this.mutate(() => this.registerItems(items));
+  }
+
+  /**
+   * Run `write`, a synchronous corpus change, and this registry's dense
+   * preparation (the configured artifact's warm when `artifact` is given,
+   * otherwise the embedding pass of a `"semantic"`/`"hybrid"` registry) as
+   * one exclusive operation: at once when nothing is in flight, otherwise
+   * once the operations in flight settle. Async operations started meanwhile
+   * run after it.
+   *
+   * @internal
+   */
+  mutate(write: () => void, artifact?: ArtifactResolver): Promise<void> {
+    return this.mutateIfChanged(() => {
+      write();
+      return true;
+    }, artifact);
+  }
+
+  /**
+   * {@link mutate} for a write that may find nothing to change once its turn
+   * comes: `write` returns whether it changed the corpus, and when it did not
+   * there is no dense preparation to run.
+   *
+   * @internal
+   */
+  mutateIfChanged(write: () => boolean, artifact?: ArtifactResolver): Promise<void> {
+    return this.#gate.exclusive(() => (write() ? this.#prepareDense(artifact) : undefined));
+  }
+
+  /** The dense half of {@link mutate}; `undefined` when there is none to wait for. */
+  #prepareDense(artifact: ArtifactResolver | undefined): Promise<void> | undefined {
+    if (artifact) {
+      return warmFromEmbeddingArtifactSource(
+        this,
+        (bytes, onMiss) => this.#warm(bytes, onMiss),
+        artifact,
+      );
+    }
+    return this.eager ? this.#buildEmbeddings() : undefined;
   }
 
   /**
@@ -245,13 +318,15 @@ export class ToolRegistry {
    * can interleave its own executor bookkeeping between metadata
    * registration and the (possibly failing) embedding pass — metadata
    * persists even if a later {@link ToolRegistry.buildDense} throws.
+   * Synchronous, so it cannot wait: while an operation owns the registry it
+   * throws {@link RegistryBusyError}.
    *
    * @internal
    */
   registerItems(item: Tool | readonly Tool[], emitDefinitions = true): void {
     assertNotArtifactBusy(this);
     const items = Array.isArray(item) ? item : [item];
-    this.native.registerMany([...items]);
+    nativeWrite(() => this.native.registerMany([...items]));
     if (emitDefinitions) {
       recordCatalogDefinitions(
         "tool",
@@ -274,8 +349,12 @@ export class ToolRegistry {
    *
    * @internal
    */
-  async buildDense(): Promise<void> {
-    if (!this.eager) return;
+  buildDense(): Promise<void> {
+    if (!this.eager) return Promise.resolve();
+    return this.#gate.shared(() => this.#buildEmbeddings());
+  }
+
+  async #buildEmbeddings(): Promise<void> {
     try {
       await this.native.buildEmbeddings();
     } catch (error) {
@@ -296,12 +375,14 @@ export class ToolRegistry {
    * @throws {EmbedderError} When embedding or backend resolution fails.
    * @throws {ArtifactError} When artifact construction fails for a non-embedder reason.
    */
-  async experimentalBuildEmbeddingArtifact(): Promise<Buffer> {
-    try {
-      return await this.native.buildEmbeddingArtifact();
-    } catch (error) {
-      throw mapArtifactBuildError(error);
-    }
+  experimentalBuildEmbeddingArtifact(): Promise<Buffer> {
+    return this.#gate.shared(async () => {
+      try {
+        return await this.native.buildEmbeddingArtifact();
+      } catch (error) {
+        throw mapArtifactBuildError(error);
+      }
+    });
   }
 
   /**
@@ -310,10 +391,11 @@ export class ToolRegistry {
    * when some corpus ids are uncovered) or `"embed"` (embed only the missing
    * ids). Independent of the registry's search method.
    */
-  async experimentalWarmEmbeddingsFromArtifact(
-    bytes: Buffer,
-    onMiss: "error" | "embed",
-  ): Promise<void> {
+  experimentalWarmEmbeddingsFromArtifact(bytes: Buffer, onMiss: "error" | "embed"): Promise<void> {
+    return this.#gate.shared(() => this.#warm(bytes, onMiss));
+  }
+
+  async #warm(bytes: Buffer, onMiss: "error" | "embed"): Promise<void> {
     try {
       await this.native.warmEmbeddingsFromArtifact(bytes, onMiss);
     } catch (error) {
@@ -361,8 +443,29 @@ export class ToolRegistry {
     return this.searchWithOptionsAsync(query, topK, origin, method, undefined, projection);
   }
 
-  /** Search on a libuv worker with an optional second-stage `reranker` (ADR-0027). */
-  async searchWithOptionsAsync(
+  /**
+   * Search on a libuv worker with an optional second-stage `reranker`
+   * (ADR-0027). Started while a register is waiting, it runs after it.
+   */
+  searchWithOptionsAsync(
+    query: string,
+    topK: number,
+    origin: SearchOrigin,
+    method: SearchMethod,
+    reranker: RerankerConfig | undefined,
+    projection?: RuntimeEventProjection,
+  ): Promise<SearchHit[]> {
+    if (usesDense(method, reranker) && this.#rebuildOnModelChange) {
+      return this.#rebuildThenSearch(query, topK, origin, method, reranker, projection);
+    }
+    return this.#gate.shared(() =>
+      this.#searchWithOptions(query, topK, origin, method, reranker, projection),
+    );
+  }
+
+  /** The opt-in model-change recovery runs first, as its own gated operation,
+   * so the search never re-enters the gate from inside an operation it holds. */
+  async #rebuildThenSearch(
     query: string,
     topK: number,
     origin: SearchOrigin,
@@ -371,12 +474,24 @@ export class ToolRegistry {
     projection?: RuntimeEventProjection,
   ): Promise<SearchHit[]> {
     try {
-      // Guard the await behind the flag so the default path stays synchronous
-      // up to the native call — the pending-dense counter must increment before
-      // control yields, or a following register() would slip past serialization.
-      if (usesDense(method, reranker) && this.#rebuildOnModelChange) {
-        await this.#maybeRebuildOnModelChange();
-      }
+      await this.#maybeRebuildOnModelChange();
+    } catch (error) {
+      throw mapEmbedderError(error);
+    }
+    return this.#gate.shared(() =>
+      this.#searchWithOptions(query, topK, origin, method, reranker, projection),
+    );
+  }
+
+  async #searchWithOptions(
+    query: string,
+    topK: number,
+    origin: SearchOrigin,
+    method: SearchMethod,
+    reranker: RerankerConfig | undefined,
+    projection?: RuntimeEventProjection,
+  ): Promise<SearchHit[]> {
+    try {
       return await this.native.searchWithOptionsAsync(
         query,
         topK,
@@ -395,32 +510,20 @@ export class ToolRegistry {
    * `retrieveFn`, a `rerankerFn` over a built-in first stage, or a built-in
    * search with an optional built-in reranker (ADR-0027). @internal
    */
-  async rankAsync(
+  rankAsync(
     query: string,
     topK: number,
     search: ResolvedSearch,
     retrieveFn: RankFn | undefined,
     projection?: RuntimeEventProjection,
   ): Promise<SearchHit[]> {
-    if (search.method === "custom") {
-      if (!retrieveFn) throw new Error('method "custom" needs a retrieveFn');
-      const context = withTurnContext(projection);
-      return customSearch(this.native, "tool", retrieveFn, query, topK, search.origin, context);
-    }
-    if (search.rerankerFn) {
-      if (usesDense(search.method) && this.#rebuildOnModelChange) {
-        await this.#maybeRebuildOnModelChange();
-      }
-      return customRerank(
-        this.native,
-        "tool",
-        search.rerankerFn,
-        query,
-        topK,
-        search.origin,
-        search.method,
-        search.rerankerDepth,
-        withTurnContext(projection),
+    if (search.method === "custom" || search.rerankerFn) {
+      // The caller's function holds no native lock across its awaits, so the
+      // search is admitted in order but does not keep a register waiting on a
+      // remote model; only its native first stage is held.
+      return this.#gate.shared(
+        () => this.#rankCustom(query, topK, search, retrieveFn, projection),
+        false,
       );
     }
     return this.searchWithOptionsAsync(
@@ -430,6 +533,36 @@ export class ToolRegistry {
       search.method,
       search.reranker,
       projection,
+    );
+  }
+
+  async #rankCustom(
+    query: string,
+    topK: number,
+    search: ResolvedSearch,
+    retrieveFn: RankFn | undefined,
+    projection: RuntimeEventProjection | undefined,
+  ): Promise<SearchHit[]> {
+    if (search.method === "custom") {
+      if (!retrieveFn) throw new Error('method "custom" needs a retrieveFn');
+      const context = withTurnContext(projection);
+      return customSearch(this.native, "tool", retrieveFn, query, topK, search.origin, context);
+    }
+    const rerankerFn = search.rerankerFn as RankFn;
+    if (usesDense(search.method) && this.#rebuildOnModelChange) {
+      await this.#maybeRebuildOnModelChange();
+    }
+    return customRerank(
+      this.native,
+      "tool",
+      rerankerFn,
+      query,
+      topK,
+      search.origin,
+      search.method,
+      search.rerankerDepth,
+      withTurnContext(projection),
+      (stageOne) => this.#gate.shared(stageOne),
     );
   }
 
@@ -451,16 +584,16 @@ export class ToolRegistry {
     // `"callback"` carries a function, which the native config object cannot,
     // so it routes to its own binding rather than through `setTraceSink`.
     if (config.kind === "callback") {
-      this.native.setTraceSinkCallback(config.sessionId, config.onEvent);
+      nativeWrite(() => this.native.setTraceSinkCallback(config.sessionId, config.onEvent));
     } else {
-      this.native.setTraceSink(config);
+      nativeWrite(() => this.native.setTraceSink(config));
     }
     this.#replayRankingStatus();
   }
 
   /** @internal Enable experimental complete catalog-definition events. */
   experimentalEnableCatalogDefinitions(): void {
-    this.native.experimentalEnableCatalogDefinitions();
+    nativeWrite(() => this.native.experimentalEnableCatalogDefinitions());
   }
 
   /** @internal Attach one public runtime-event subscriber. */
@@ -468,7 +601,7 @@ export class ToolRegistry {
     handler: (batch: RuntimeEvent[]) => void,
     options: Required<RuntimeEventsOptions>,
   ): NativeEventSubscription {
-    const subscription = this.native.subscribeTraceEvents(handler, options);
+    const subscription = nativeWrite(() => this.native.subscribeTraceEvents(handler, options));
     this.#replayRankingStatus();
     return subscription;
   }
@@ -528,15 +661,17 @@ export class ToolRegistry {
     }
     // The same three knobs `experimentalBuildIntentGraph` takes, so what
     // counts as evidence does not depend on which path produced the graph.
-    this.native.enableAdaptiveRanking(
-      graph,
-      {
-        origins: options.origins,
-        provenance: options.provenance,
-        clusterSimilarity: options.clusterSimilarity,
-        clusterCoverage: options.clusterCoverage,
-      },
-      options.learn,
+    nativeWrite(() =>
+      this.native.enableAdaptiveRanking(
+        graph,
+        {
+          origins: options.origins,
+          provenance: options.provenance,
+          clusterSimilarity: options.clusterSimilarity,
+          clusterCoverage: options.clusterCoverage,
+        },
+        options.learn,
+      ),
     );
     // Only recorded once native accepts the call: a rejected call (bad
     // origins/provenance/cluster policy) leaves native's own state untouched,
@@ -565,7 +700,11 @@ export class ToolRegistry {
    * the usage arm pauses until this runs. Members, support, and edges are
    * preserved — only the centroids move to the new space.
    */
-  async experimentalRebuildIntentGraph(): Promise<void> {
+  experimentalRebuildIntentGraph(): Promise<void> {
+    return this.#gate.shared(() => this.#rebuildIntentGraph());
+  }
+
+  async #rebuildIntentGraph(): Promise<void> {
     try {
       await this.native.rebuildIntentGraph();
     } catch (error) {
@@ -601,17 +740,19 @@ export class ToolRegistry {
    *   building from a log is. Pass `{ origins: "agent", provenance: "live" }`
    *   to re-derive a graph from a period when Ratel was already serving.
    */
-  async experimentalBuildIntentGraph(
+  experimentalBuildIntentGraph(
     jsonl: string,
     options: ObservationPolicyOptions = {},
   ): Promise<IntentGraph> {
-    let json: string;
-    try {
-      json = await this.native.buildIntentGraph(jsonl, options);
-    } catch (error) {
-      throw mapEmbedderError(error);
-    }
-    return IntentGraph.fromJson(json);
+    return this.#gate.shared(async () => {
+      let json: string;
+      try {
+        json = await this.native.buildIntentGraph(jsonl, options);
+      } catch (error) {
+        throw mapEmbedderError(error);
+      }
+      return IntentGraph.fromJson(json);
+    });
   }
 
   /**
@@ -695,7 +836,7 @@ export class ToolRegistry {
    */
   experimentalDisableAdaptiveRanking(): void {
     this.#rebuildOnModelChange = false;
-    this.native.disableAdaptiveRanking();
+    nativeWrite(() => this.native.disableAdaptiveRanking());
     // Report only a real change: disabling with nothing attached changes nothing.
     if (this.#graph) this.recordEvent(DISABLED_RANKING_STATUS);
     if (this.#graph) forgetGraphLearn(this.#graph, this);
@@ -729,6 +870,8 @@ export class SkillRegistry {
   private readonly eager: boolean;
   private readonly emittedDefinitionHashes = new Map<string, string>();
   private useDefinitionOverrides = false;
+  /** Admits this registry's async operations; see {@link OperationGate}. */
+  readonly #gate = new OperationGate();
 
   /**
    * Create a registry with an optional embedding model and retrieval method.
@@ -764,13 +907,55 @@ export class SkillRegistry {
 
   /**
    * Register one skill or a batch, replacing any existing id in place — see
-   * {@link ToolRegistry.register} for the embed-inside contract.
+   * {@link ToolRegistry.register} for the embed-inside contract and for how a
+   * register waits while an operation is in flight.
    *
    * @param item - A single {@link Skill} or a readonly array of them.
    */
-  async register(item: Skill | readonly Skill[]): Promise<void> {
-    this.registerItems(item);
-    await this.buildDense();
+  register(item: Skill | readonly Skill[]): Promise<void> {
+    const items = Array.isArray(item) ? [...item] : [item];
+    return this.mutate(() => this.registerItems(items));
+  }
+
+  /**
+   * Run a synchronous corpus change and its dense preparation as one exclusive
+   * operation, waiting for operations in flight — see
+   * {@link ToolRegistry.mutate}.
+   *
+   * @internal
+   */
+  mutate(write: () => void, artifact?: ArtifactResolver): Promise<void> {
+    return this.#gate.exclusive(() => {
+      write();
+      return this.#prepareDense(artifact);
+    });
+  }
+
+  /**
+   * {@link mutate} for a write that must land at the call site (the corpus
+   * swap of {@link SkillCatalog.replaceAll}): runs now or throws
+   * {@link RegistryBusyError}, never queues. Its dense preparation still holds
+   * the registry, so a register made meanwhile waits for it.
+   *
+   * @internal
+   */
+  mutateNow(write: () => void, artifact?: ArtifactResolver): Promise<void> {
+    return this.#gate.exclusiveNow(() => {
+      write();
+      return this.#prepareDense(artifact);
+    });
+  }
+
+  /** The dense half of {@link mutate}; `undefined` when there is none to wait for. */
+  #prepareDense(artifact: ArtifactResolver | undefined): Promise<void> | undefined {
+    if (artifact) {
+      return warmFromEmbeddingArtifactSource(
+        this,
+        (bytes, onMiss) => this.#warm(bytes, onMiss),
+        artifact,
+      );
+    }
+    return this.eager ? this.#buildEmbeddings() : undefined;
   }
 
   /**
@@ -782,7 +967,7 @@ export class SkillRegistry {
   registerItems(item: Skill | readonly Skill[]): void {
     assertNotArtifactBusy(this);
     const items = Array.isArray(item) ? item : [item];
-    this.native.registerMany([...items]);
+    nativeWrite(() => this.native.registerMany([...items]));
     recordCatalogDefinitions(
       "skill",
       items,
@@ -798,12 +983,19 @@ export class SkillRegistry {
    * along with their cached embeddings; ids whose indexed text changed are
    * invalidated for re-embedding, and unchanged ids keep the vector they have,
    * so the following {@link SkillRegistry.buildDense} only embeds real changes.
+   * `adoptOverrides` takes definition-override ownership once the swap has
+   * landed (never on a refusal), ahead of the definitions it records.
    *
    * @internal
    */
-  replaceAllItems(items: readonly Skill[], emitDefinitions = true): ReplaceOutcome {
+  replaceAllItems(
+    items: readonly Skill[],
+    emitDefinitions = true,
+    adoptOverrides = false,
+  ): ReplaceOutcome {
     assertNotArtifactBusy(this);
-    const outcome = this.native.replaceAll([...items]);
+    const outcome = nativeWrite(() => this.native.replaceAll([...items]));
+    if (adoptOverrides) this.setUseDefinitionOverrides();
     if (emitDefinitions) {
       recordCatalogDefinitions(
         "skill",
@@ -826,8 +1018,12 @@ export class SkillRegistry {
    *
    * @internal
    */
-  async buildDense(): Promise<void> {
-    if (!this.eager) return;
+  buildDense(): Promise<void> {
+    if (!this.eager) return Promise.resolve();
+    return this.#gate.shared(() => this.#buildEmbeddings());
+  }
+
+  async #buildEmbeddings(): Promise<void> {
     try {
       await this.native.buildEmbeddings();
     } catch (error) {
@@ -843,22 +1039,25 @@ export class SkillRegistry {
    * @throws {EmbedderError} When embedding or backend resolution fails.
    * @throws {ArtifactError} When artifact construction fails for a non-embedder reason.
    */
-  async experimentalBuildEmbeddingArtifact(): Promise<Buffer> {
-    try {
-      return await this.native.buildEmbeddingArtifact();
-    } catch (error) {
-      throw mapArtifactBuildError(error);
-    }
+  experimentalBuildEmbeddingArtifact(): Promise<Buffer> {
+    return this.#gate.shared(async () => {
+      try {
+        return await this.native.buildEmbeddingArtifact();
+      } catch (error) {
+        throw mapArtifactBuildError(error);
+      }
+    });
   }
 
   /**
    * Warm the dense cache from a build-time embedding artifact — see
    * {@link ToolRegistry.experimentalWarmEmbeddingsFromArtifact}.
    */
-  async experimentalWarmEmbeddingsFromArtifact(
-    bytes: Buffer,
-    onMiss: "error" | "embed",
-  ): Promise<void> {
+  experimentalWarmEmbeddingsFromArtifact(bytes: Buffer, onMiss: "error" | "embed"): Promise<void> {
+    return this.#gate.shared(() => this.#warm(bytes, onMiss));
+  }
+
+  async #warm(bytes: Buffer, onMiss: "error" | "embed"): Promise<void> {
     try {
       await this.native.warmEmbeddingsFromArtifact(bytes, onMiss);
     } catch (error) {
@@ -900,7 +1099,25 @@ export class SkillRegistry {
   }
 
   /** Search with an optional reranker — see `ToolRegistry.searchWithOptionsAsync`. */
-  async searchWithOptionsAsync(
+  searchWithOptionsAsync(
+    query: string,
+    topK: number,
+    origin: SearchOrigin,
+    method: SearchMethod,
+    reranker: RerankerConfig | undefined,
+    projection?: RuntimeEventProjection,
+  ): Promise<SkillHit[]> {
+    if (usesDense(method, reranker) && this.#rebuildOnModelChange) {
+      return this.#rebuildThenSearch(query, topK, origin, method, reranker, projection);
+    }
+    return this.#gate.shared(() =>
+      this.#searchWithOptions(query, topK, origin, method, reranker, projection),
+    );
+  }
+
+  /** The opt-in model-change recovery runs first, as its own gated operation,
+   * so the search never re-enters the gate from inside an operation it holds. */
+  async #rebuildThenSearch(
     query: string,
     topK: number,
     origin: SearchOrigin,
@@ -909,9 +1126,24 @@ export class SkillRegistry {
     projection?: RuntimeEventProjection,
   ): Promise<SkillHit[]> {
     try {
-      if (usesDense(method, reranker) && this.#rebuildOnModelChange) {
-        await this.#maybeRebuildOnModelChange();
-      }
+      await this.#maybeRebuildOnModelChange();
+    } catch (error) {
+      throw mapEmbedderError(error);
+    }
+    return this.#gate.shared(() =>
+      this.#searchWithOptions(query, topK, origin, method, reranker, projection),
+    );
+  }
+
+  async #searchWithOptions(
+    query: string,
+    topK: number,
+    origin: SearchOrigin,
+    method: SearchMethod,
+    reranker: RerankerConfig | undefined,
+    projection?: RuntimeEventProjection,
+  ): Promise<SkillHit[]> {
+    try {
       return await this.native.searchWithOptionsAsync(
         query,
         topK,
@@ -924,33 +1156,20 @@ export class SkillRegistry {
       throw mapEmbedderError(error);
     }
   }
+
   /** Run one resolved `searchAsync` — see `ToolRegistry.rankAsync`. @internal */
-  async rankAsync(
+  rankAsync(
     query: string,
     topK: number,
     search: ResolvedSearch,
     retrieveFn: RankFn | undefined,
     projection?: RuntimeEventProjection,
   ): Promise<SkillHit[]> {
-    if (search.method === "custom") {
-      if (!retrieveFn) throw new Error('method "custom" needs a retrieveFn');
-      const context = withTurnContext(projection);
-      return customSearch(this.native, "skill", retrieveFn, query, topK, search.origin, context);
-    }
-    if (search.rerankerFn) {
-      if (usesDense(search.method) && this.#rebuildOnModelChange) {
-        await this.#maybeRebuildOnModelChange();
-      }
-      return customRerank(
-        this.native,
-        "skill",
-        search.rerankerFn,
-        query,
-        topK,
-        search.origin,
-        search.method,
-        search.rerankerDepth,
-        withTurnContext(projection),
+    if (search.method === "custom" || search.rerankerFn) {
+      // Admitted in order but not held — see `ToolRegistry.rankAsync`.
+      return this.#gate.shared(
+        () => this.#rankCustom(query, topK, search, retrieveFn, projection),
+        false,
       );
     }
     return this.searchWithOptionsAsync(
@@ -960,6 +1179,36 @@ export class SkillRegistry {
       search.method,
       search.reranker,
       projection,
+    );
+  }
+
+  async #rankCustom(
+    query: string,
+    topK: number,
+    search: ResolvedSearch,
+    retrieveFn: RankFn | undefined,
+    projection: RuntimeEventProjection | undefined,
+  ): Promise<SkillHit[]> {
+    if (search.method === "custom") {
+      if (!retrieveFn) throw new Error('method "custom" needs a retrieveFn');
+      const context = withTurnContext(projection);
+      return customSearch(this.native, "skill", retrieveFn, query, topK, search.origin, context);
+    }
+    const rerankerFn = search.rerankerFn as RankFn;
+    if (usesDense(search.method) && this.#rebuildOnModelChange) {
+      await this.#maybeRebuildOnModelChange();
+    }
+    return customRerank(
+      this.native,
+      "skill",
+      rerankerFn,
+      query,
+      topK,
+      search.origin,
+      search.method,
+      search.rerankerDepth,
+      withTurnContext(projection),
+      (stageOne) => this.#gate.shared(stageOne),
     );
   }
 
@@ -978,16 +1227,16 @@ export class SkillRegistry {
     // `"callback"` carries a function, which the native config object cannot,
     // so it routes to its own binding rather than through `setTraceSink`.
     if (config.kind === "callback") {
-      this.native.setTraceSinkCallback(config.sessionId, config.onEvent);
+      nativeWrite(() => this.native.setTraceSinkCallback(config.sessionId, config.onEvent));
     } else {
-      this.native.setTraceSink(config);
+      nativeWrite(() => this.native.setTraceSink(config));
     }
     this.#replayRankingStatus();
   }
 
   /** @internal Enable experimental complete catalog-definition events. */
   experimentalEnableCatalogDefinitions(): void {
-    this.native.experimentalEnableCatalogDefinitions();
+    nativeWrite(() => this.native.experimentalEnableCatalogDefinitions());
   }
 
   /** @internal Attach one public runtime-event subscriber. */
@@ -995,7 +1244,7 @@ export class SkillRegistry {
     handler: (batch: RuntimeEvent[]) => void,
     options: Required<RuntimeEventsOptions>,
   ): NativeEventSubscription {
-    const subscription = this.native.subscribeTraceEvents(handler, options);
+    const subscription = nativeWrite(() => this.native.subscribeTraceEvents(handler, options));
     this.#replayRankingStatus();
     return subscription;
   }
@@ -1055,15 +1304,17 @@ export class SkillRegistry {
     }
     // The same three knobs `experimentalBuildIntentGraph` takes, so what
     // counts as evidence does not depend on which path produced the graph.
-    this.native.enableAdaptiveRanking(
-      graph,
-      {
-        origins: options.origins,
-        provenance: options.provenance,
-        clusterSimilarity: options.clusterSimilarity,
-        clusterCoverage: options.clusterCoverage,
-      },
-      options.learn,
+    nativeWrite(() =>
+      this.native.enableAdaptiveRanking(
+        graph,
+        {
+          origins: options.origins,
+          provenance: options.provenance,
+          clusterSimilarity: options.clusterSimilarity,
+          clusterCoverage: options.clusterCoverage,
+        },
+        options.learn,
+      ),
     );
     // Only recorded once native accepts the call: a rejected call (bad
     // origins/provenance/cluster policy) leaves native's own state untouched,
@@ -1092,7 +1343,11 @@ export class SkillRegistry {
    * the usage arm pauses until this runs. Members, support, and edges are
    * preserved — only the centroids move to the new space.
    */
-  async experimentalRebuildIntentGraph(): Promise<void> {
+  experimentalRebuildIntentGraph(): Promise<void> {
+    return this.#gate.shared(() => this.#rebuildIntentGraph());
+  }
+
+  async #rebuildIntentGraph(): Promise<void> {
     try {
       await this.native.rebuildIntentGraph();
     } catch (error) {
@@ -1187,7 +1442,7 @@ export class SkillRegistry {
    */
   experimentalDisableAdaptiveRanking(): void {
     this.#rebuildOnModelChange = false;
-    this.native.disableAdaptiveRanking();
+    nativeWrite(() => this.native.disableAdaptiveRanking());
     // Report only a real change: disabling with nothing attached changes nothing.
     if (this.#graph) this.recordEvent(DISABLED_RANKING_STATUS);
     if (this.#graph) forgetGraphLearn(this.#graph, this);
@@ -1212,6 +1467,8 @@ export class FactRegistry {
   private readonly eager: boolean;
   private readonly emittedDefinitionHashes = new Map<string, string>();
   private useDefinitionOverrides = false;
+  /** Admits this registry's async operations; see {@link OperationGate}. */
+  readonly #gate = new OperationGate();
 
   /**
    * Create a registry with an optional embedding model and retrieval method.
@@ -1228,15 +1485,42 @@ export class FactRegistry {
 
   /**
    * Register one fact or a batch, replacing any existing id in place — see
-   * {@link ToolRegistry.register} for the embed-inside contract. A malformed
-   * `id` or an unknown `pin` throws before anything is indexed — the returned
-   * promise rejects, since the method is `async`.
+   * {@link ToolRegistry.register} for the embed-inside contract and for how a
+   * register waits while an operation is in flight. A malformed `id` or an
+   * unknown `pin` throws before anything is indexed — the returned promise
+   * rejects.
    *
    * @param item - A single {@link Fact} or a readonly array of them.
    */
-  async register(item: Fact | readonly Fact[]): Promise<void> {
-    this.registerItems(item);
-    await this.buildDense();
+  register(item: Fact | readonly Fact[]): Promise<void> {
+    const items = Array.isArray(item) ? [...item] : [item];
+    return this.mutate(() => this.registerItems(items));
+  }
+
+  /**
+   * Run a synchronous corpus change and its embedding pass as one exclusive
+   * operation, waiting for operations in flight — see
+   * {@link ToolRegistry.mutate}.
+   *
+   * @internal
+   */
+  mutate(write: () => void): Promise<void> {
+    return this.mutateIfChanged(() => {
+      write();
+      return true;
+    });
+  }
+
+  /**
+   * {@link mutate} for a write that may find nothing to change — see
+   * {@link ToolRegistry.mutateIfChanged}.
+   *
+   * @internal
+   */
+  mutateIfChanged(write: () => boolean): Promise<void> {
+    return this.#gate.exclusive(() =>
+      write() && this.eager ? this.#buildEmbeddings() : undefined,
+    );
   }
 
   /**
@@ -1250,7 +1534,7 @@ export class FactRegistry {
   registerItems(item: Fact | readonly Fact[], emitDefinitions = true): void {
     const items = Array.isArray(item) ? item : [item];
     for (const fact of items) assertValidFact(fact);
-    this.native.registerMany([...items]);
+    nativeWrite(() => this.native.registerMany([...items]));
     if (emitDefinitions) {
       recordCatalogDefinitions(
         "fact",
@@ -1272,8 +1556,12 @@ export class FactRegistry {
    *
    * @internal
    */
-  async buildDense(): Promise<void> {
-    if (!this.eager) return;
+  buildDense(): Promise<void> {
+    if (!this.eager) return Promise.resolve();
+    return this.#gate.shared(() => this.#buildEmbeddings());
+  }
+
+  async #buildEmbeddings(): Promise<void> {
     try {
       await this.native.buildEmbeddings();
     } catch (error) {
@@ -1302,17 +1590,19 @@ export class FactRegistry {
   }
 
   /** Search on a libuv worker — see `ToolRegistry.searchWithMethodAsync`. */
-  async searchWithMethodAsync(
+  searchWithMethodAsync(
     query: string,
     topK: number,
     origin: SearchOrigin,
     method: SearchMethod,
   ): Promise<FactHit[]> {
-    try {
-      return await this.native.searchWithMethodAsync(query, topK, origin, method);
-    } catch (error) {
-      throw mapEmbedderError(error);
-    }
+    return this.#gate.shared(async () => {
+      try {
+        return await this.native.searchWithMethodAsync(query, topK, origin, method);
+      } catch (error) {
+        throw mapEmbedderError(error);
+      }
+    });
   }
 
   /** Record a custom event on the local trace stream (ADR-0007). */
@@ -1322,12 +1612,12 @@ export class FactRegistry {
 
   /** Replace the trace sink; subsequent events go to the new destination. */
   setTraceSink(config: TraceSinkConfig): void {
-    this.native.setTraceSink(config);
+    nativeWrite(() => this.native.setTraceSink(config));
   }
 
   /** @internal Enable experimental complete catalog-definition events. */
   experimentalEnableCatalogDefinitions(): void {
-    this.native.experimentalEnableCatalogDefinitions();
+    nativeWrite(() => this.native.experimentalEnableCatalogDefinitions());
   }
 
   /** Drain captured envelopes from a `"memory"` sink; `[]` otherwise. */

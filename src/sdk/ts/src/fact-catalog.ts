@@ -110,6 +110,11 @@ export class FactCatalog {
    * if set, must be `"always"` or `"retrieved"`. A bad value throws before
    * anything is indexed.
    *
+   * While an asynchronous operation on the catalog is in flight (a
+   * {@link FactCatalog.searchAsync} or `ground`, another register's embedding
+   * pass), the write waits for it instead of failing; see
+   * `ToolCatalog.register`.
+   *
    * @param facts - A single fact or a readonly array of them.
    */
   async register(facts: Fact | readonly Fact[]): Promise<void> {
@@ -117,7 +122,7 @@ export class FactCatalog {
     for (const fact of batch) assertValidFact(fact);
     const localBatch = batch.map((fact) => structuredClone(fact));
     await this.registerEffective(
-      localBatch.map((fact) => this.applyDefinitionOverride(fact)),
+      () => localBatch.map((fact) => this.applyDefinitionOverride(fact)),
       localBatch,
     );
   }
@@ -135,15 +140,22 @@ export class FactCatalog {
   ): Promise<void> {
     const { adopt = true, emitDefinitions = true } = options;
     this.overrideSearchableDescriptions = new Map(overrides);
-    const effective = [...this.localFacts.values()].map((fact) =>
-      this.applyDefinitionOverride(fact),
+    // Read when the write lands, not here — see `ToolCatalog.applyDefinitionOverrides`.
+    await this.registerEffective(
+      () => {
+        const effective = [...this.localFacts.values()].map((fact) =>
+          this.applyDefinitionOverride(fact),
+        );
+        if (adopt) this.registry.setUseDefinitionOverrides(effective);
+        const changed = effective.filter((fact) => {
+          const current = this.facts.get(fact.id);
+          return current === undefined || !hasSameRetrievalDescription(current, fact);
+        });
+        return changed.length > 0 ? changed : undefined;
+      },
+      undefined,
+      emitDefinitions,
     );
-    if (adopt) this.registry.setUseDefinitionOverrides(effective);
-    const changed = effective.filter((fact) => {
-      const current = this.facts.get(fact.id);
-      return current === undefined || !hasSameRetrievalDescription(current, fact);
-    });
-    if (changed.length > 0) await this.registerEffective(changed, undefined, emitDefinitions);
   }
 
   /** @internal Commit one-way definition-override ownership after a staged apply. */
@@ -151,22 +163,30 @@ export class FactCatalog {
     this.registry.setUseDefinitionOverrides([...this.facts.values()]);
   }
 
-  private async registerEffective(
-    batch: readonly Fact[],
+  /**
+   * Index `effective()` and embed it, waiting for operations in flight.
+   * `effective` runs when the write lands; `undefined` means nothing to write.
+   */
+  private registerEffective(
+    effective: () => readonly Fact[] | undefined,
     localBatch?: readonly Fact[],
     emitDefinitions = true,
   ): Promise<void> {
-    // Validation lives in `registerItems` (the registry is public too), which
-    // checks the whole batch before indexing any of it — so the local map below
-    // can only ever see facts the registry accepted.
-    this.registry.registerItems(batch, emitDefinitions);
-    if (localBatch) {
-      for (const fact of localBatch) this.localFacts.set(fact.id, fact);
-    }
-    for (const fact of batch) {
-      this.facts.set(fact.id, fact);
-    }
-    await this.registry.buildDense();
+    return this.registry.mutateIfChanged(() => {
+      const batch = effective();
+      if (batch === undefined) return false;
+      // Validation lives in `registerItems` (the registry is public too), which
+      // checks the whole batch before indexing any of it — so the local map
+      // below can only ever see facts the registry accepted.
+      this.registry.registerItems(batch, emitDefinitions);
+      if (localBatch) {
+        for (const fact of localBatch) this.localFacts.set(fact.id, fact);
+      }
+      for (const fact of batch) {
+        this.facts.set(fact.id, fact);
+      }
+      return true;
+    });
   }
 
   private applyDefinitionOverride(fact: Fact): Fact {

@@ -90,6 +90,7 @@ export {
   DimensionMismatchError,
   EmbedderError,
   IncompatibleMergeError,
+  RegistryBusyError,
   RetrieverError,
 } from "./errors.js";
 export { experimentalDefineExperiment } from "./experiment.js";

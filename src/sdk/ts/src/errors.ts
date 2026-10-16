@@ -7,8 +7,12 @@
  * recognizes the embedding failures among them (by their stable message
  * signatures) and re-raises them as these typed classes so callers can branch on
  * `instanceof` / `code` instead of matching message text. Non-embedding errors
- * (registry-busy, lock-poison, the sync "use searchAsync" guard, and
- * construction-time config errors) are passed through unchanged.
+ * (lock-poison, the sync "use searchAsync" guard, and construction-time config
+ * errors) are passed through unchanged.
+ *
+ * {@link RegistryBusyError} / {@link mapRegistryBusyError} cover the refusal a
+ * synchronous registry mutation still raises while an operation owns the
+ * registry.
  *
  * {@link ArtifactWarmError} / {@link mapArtifactWarmError} cover failures from
  * `experimentalWarmEmbeddingsFromArtifact` (ADR-0018), decoded from a private
@@ -19,6 +23,51 @@
  * `experimentalBuildEmbeddingArtifact` and internal merge, decoded from a
  * separate private envelope.
  */
+
+/**
+ * The refusal's message, unchanged from when it was a plain `Error`. Must stay
+ * identical to native `REGISTRY_BUSY_MESSAGE`.
+ */
+const REGISTRY_BUSY_MESSAGE =
+  "registry busy; await the active operation before registering more items";
+
+/**
+ * A synchronous registry mutation was refused because an operation owns the
+ * registry: a search, an embedding pass, an artifact build or warm, or a
+ * queued `register`. `register` itself never throws it while it can wait; it
+ * comes from the calls that cannot queue, such as `SkillCatalog.replaceAll`,
+ * `setTraceSink` and `experimentalEnableAdaptiveRanking`. Retryable: await the
+ * operation in flight, then call again.
+ *
+ * A subclass of `Error` with the message the plain `Error` carried, so existing
+ * `catch` blocks and message checks keep working. Mirrors Python's
+ * `RegistryBusyError`.
+ */
+export class RegistryBusyError extends Error {
+  /** Stable machine-readable discriminant; prefer it (or `instanceof`) over the message. */
+  readonly code = "registry_busy" as const;
+
+  /** @param message - Defaults to the message the refusal has always carried. */
+  constructor(message: string = REGISTRY_BUSY_MESSAGE) {
+    super(message);
+    this.name = "RegistryBusyError";
+  }
+}
+
+/**
+ * Re-raise the native "registry busy" refusal as a typed
+ * {@link RegistryBusyError}. Any other error is returned unchanged.
+ *
+ * @param error - The error thrown by the native binding.
+ * @returns The typed refusal, or `error` unchanged when it is not one.
+ */
+export function mapRegistryBusyError(error: unknown): unknown {
+  if (error instanceof RegistryBusyError) return error;
+  if (error instanceof Error && error.message === REGISTRY_BUSY_MESSAGE) {
+    return new RegistryBusyError(error.message);
+  }
+  return error;
+}
 
 /** Stable failure categories for the experimental definition-overlay boundary. */
 export type DefinitionOverlayErrorCode =

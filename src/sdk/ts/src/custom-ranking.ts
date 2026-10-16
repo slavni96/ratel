@@ -89,7 +89,11 @@ export async function customSearch<H, S extends { candidates: { id: string; text
   return native.completeCustomSearch(query, topK, origin, ranked, elapsedMs(started), context);
 }
 
-/** Run stage 1 natively, rerank its candidates with `fn`, and complete the search. @internal */
+/**
+ * Run stage 1 natively, rerank its candidates with `fn`, and complete the
+ * search. `track` wraps the native stage 1, the only part that holds the
+ * registry, so the registry's gate can count it. @internal
+ */
 export async function customRerank<H, S extends { candidates: { id: string; text: string }[] }>(
   native: NativeCustomRanking<H, S>,
   kind: RankCandidateKind,
@@ -100,10 +104,11 @@ export async function customRerank<H, S extends { candidates: { id: string; text
   method: string,
   depth: number,
   context: RuntimeEventProjection | undefined,
+  track: (stageOne: () => Promise<S>) => Promise<S> = (stageOne) => stageOne(),
 ): Promise<H[]> {
   let stage: S;
   try {
-    stage = await native.stageOneAsync(query, topK, depth, method, context?.turnId);
+    stage = await track(() => native.stageOneAsync(query, topK, depth, method, context?.turnId));
   } catch (error) {
     throw mapEmbedderError(error);
   }

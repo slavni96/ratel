@@ -120,7 +120,7 @@ describe("SkillCatalog", () => {
     expect(catalog.size()).toBe(0);
   });
 
-  it("serializes queued dense searches and rejects registration until they settle", async () => {
+  it("serializes queued dense searches and makes registration wait until they settle", async () => {
     const server = await startDelayedEmbeddingServer();
     try {
       const catalog = new SkillCatalog({
@@ -131,9 +131,9 @@ describe("SkillCatalog", () => {
 
       const first = catalog.searchAsync("slides", 5);
       const second = catalog.searchAsync("frontend", 5);
-      await expect(catalog.register(apiDesign)).rejects.toThrow(/registry busy; await/);
-      await Promise.all([first, second]);
       await expect(catalog.register(apiDesign)).resolves.toBeUndefined();
+      await Promise.all([first, second]);
+      expect(catalog.has("api-design")).toBe(true);
     } finally {
       await server.close();
     }

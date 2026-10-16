@@ -1,6 +1,5 @@
 import { SearchTarget } from "@ratel-ai/telemetry";
 import type { NativeEventSubscription, SearchHit, Tool } from "../native/index.cjs";
-import { warmFromEmbeddingArtifactSource } from "./artifact-source-warm.js";
 import { isAsyncIterable, isPromiseLike } from "./async.js";
 import {
   type DefinitionOverrideApplyOptions,
@@ -737,6 +736,16 @@ export class ToolCatalog {
    * A model or dimension change is not recovered in place — construct a new
    * catalog and re-register.
    *
+   * With nothing in flight on the catalog, the tools are indexed (and
+   * invokable) synchronously, at the call, so an un-awaited `register` is
+   * BM25-searchable at once. While an asynchronous operation is in flight (a
+   * {@link ToolCatalog.searchAsync}, another register's embedding pass, an
+   * artifact warm), the write waits for it to settle instead of failing, and
+   * the promise resolves once the write and its dense preparation are done. A
+   * `searchAsync` started while a register is waiting runs after it, so it
+   * sees the new tools. A `retrieveFn` / `rerankerFn` in progress does not
+   * hold a register back; only the native part of a search does.
+   *
    * @param tools - A single tool or a readonly array of tools; each
    *   `execute` must be set. Pass the whole batch at once for a single
    *   dense-preparation request — separate `register` calls prepare separately.
@@ -752,8 +761,10 @@ export class ToolCatalog {
       }
     }
     const localBatch = batch.map(snapshotExecutableTool);
+    // The overlay is applied when the write lands, so a register that waited
+    // picks up an overlay applied meanwhile.
     await this.registerEffective(
-      localBatch.map((tool) => this.applyDefinitionOverride(tool)),
+      () => localBatch.map((tool) => this.applyDefinitionOverride(tool)),
       localBatch,
     );
   }
@@ -765,15 +776,24 @@ export class ToolCatalog {
   ): Promise<void> {
     const { adopt = true, emitDefinitions = true } = options;
     this.overrideSearchableDescriptions = new Map(overrides);
-    const effective = [...this.localTools.values()].map((tool) =>
-      this.applyDefinitionOverride(tool),
+    // The local tools are read when the write lands, not here: a register
+    // queued ahead of this apply may replace one meanwhile, and a snapshot
+    // taken now would write the older definition back over it.
+    await this.registerEffective(
+      () => {
+        const effective = [...this.localTools.values()].map((tool) =>
+          this.applyDefinitionOverride(tool),
+        );
+        if (adopt) this.registry.setUseDefinitionOverrides(effective);
+        const changed = effective.filter((tool) => {
+          const current = this.tools.get(tool.id);
+          return current === undefined || !hasSameRetrievalDescription(current, tool);
+        });
+        return changed.length > 0 ? changed : undefined;
+      },
+      undefined,
+      emitDefinitions,
     );
-    if (adopt) this.registry.setUseDefinitionOverrides(effective);
-    const changed = effective.filter((tool) => {
-      const current = this.tools.get(tool.id);
-      return current === undefined || !hasSameRetrievalDescription(current, tool);
-    });
-    if (changed.length > 0) await this.registerEffective(changed, undefined, emitDefinitions);
   }
 
   /** @internal Commit one-way definition-override ownership after a staged apply. */
@@ -781,29 +801,44 @@ export class ToolCatalog {
     this.registry.setUseDefinitionOverrides([...this.tools.values()]);
   }
 
-  private async registerEffective(
-    batch: readonly ExecutableTool[],
+  /**
+   * Index `effective()` and prepare it, waiting for operations in flight.
+   * `effective` runs when the write lands; `undefined` means nothing to write,
+   * and then nothing is prepared either.
+   */
+  private registerEffective(
+    effective: () => readonly ExecutableTool[] | undefined,
     localBatch?: readonly ExecutableTool[],
     emitDefinitions = true,
   ): Promise<void> {
-    this.registry.registerItems(
-      batch.map(({ execute: _execute, validateInput: _validateInput, ...metadata }) => metadata),
-      emitDefinitions,
+    const artifact = this.embeddingArtifact;
+    return this.registry.mutateIfChanged(
+      () => {
+        const batch = effective();
+        if (batch === undefined) return false;
+        this.registry.registerItems(
+          batch.map(
+            ({ execute: _execute, validateInput: _validateInput, ...metadata }) => metadata,
+          ),
+          emitDefinitions,
+        );
+        if (localBatch) {
+          for (const tool of localBatch) this.localTools.set(tool.id, tool);
+        }
+        for (const tool of batch) {
+          const { execute, validateInput, ...metadata } = tool;
+          this.executors.set(tool.id, execute);
+          if (validateInput) {
+            this.inputValidators.set(tool.id, validateInput);
+          } else {
+            this.inputValidators.delete(tool.id);
+          }
+          this.tools.set(tool.id, metadata);
+        }
+        return true;
+      },
+      artifact ? () => resolveEmbeddingArtifact(artifact) : undefined,
     );
-    if (localBatch) {
-      for (const tool of localBatch) this.localTools.set(tool.id, tool);
-    }
-    for (const tool of batch) {
-      const { execute, validateInput, ...metadata } = tool;
-      this.executors.set(tool.id, execute);
-      if (validateInput) {
-        this.inputValidators.set(tool.id, validateInput);
-      } else {
-        this.inputValidators.delete(tool.id);
-      }
-      this.tools.set(tool.id, metadata);
-    }
-    await this.ensureDenseReady();
   }
 
   private applyDefinitionOverride(tool: ExecutableTool): ExecutableTool {
@@ -813,17 +848,6 @@ export class ToolCatalog {
       this.overrideSearchableDescriptions,
       this.warnedShadowIds,
     );
-  }
-
-  private async ensureDenseReady(): Promise<void> {
-    const artifact = this.embeddingArtifact;
-    if (artifact) {
-      await warmFromEmbeddingArtifactSource(this.registry, () =>
-        resolveEmbeddingArtifact(artifact),
-      );
-      return;
-    }
-    await this.registry.buildDense();
   }
 
   /**

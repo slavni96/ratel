@@ -700,7 +700,7 @@ describe("catalog experimentalEmbeddingArtifact", () => {
     return { ...tool, execute: async () => ({}) };
   }
 
-  it("artifact register refuses a racing register with registry busy ({ path })", async () => {
+  it("artifact register queues a racing register behind the warm ({ path })", async () => {
     const server = await startDelayedEmbeddingServer();
     try {
       const embedding = { url: server.url, model: "test-model" };
@@ -720,19 +720,16 @@ describe("catalog experimentalEmbeddingArtifact", () => {
         catalog.register(withExecute(readFileTool)),
         catalog.register(withExecute(writeFileTool)),
       ]);
-      expect(settled.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
-      expect(settled[1]).toMatchObject({
-        status: "rejected",
-        reason: expect.objectContaining({
-          message: expect.stringMatching(/registry busy; await/),
-        }),
-      });
+      // The second waits for the first's warm, then warms over both.
+      expect(settled.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(catalog.has("read_file")).toBe(true);
+      expect(catalog.has("write_file")).toBe(true);
     } finally {
       await server.close();
     }
   });
 
-  it("artifact register refuses a racing register with registry busy ({ bytes })", async () => {
+  it("artifact register queues a racing register behind the warm ({ bytes })", async () => {
     const server = await startDelayedEmbeddingServer();
     try {
       const embedding = { url: server.url, model: "test-model" };
@@ -753,19 +750,16 @@ describe("catalog experimentalEmbeddingArtifact", () => {
         catalog.register(withExecute(readFileTool)),
         catalog.register(withExecute(writeFileTool)),
       ]);
-      expect(settled.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
-      expect(settled[1]).toMatchObject({
-        status: "rejected",
-        reason: expect.objectContaining({
-          message: expect.stringMatching(/registry busy; await/),
-        }),
-      });
+      // The second waits for the first's warm, then warms over both.
+      expect(settled.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(catalog.has("read_file")).toBe(true);
+      expect(catalog.has("write_file")).toBe(true);
     } finally {
       await server.close();
     }
   });
 
-  it("SkillCatalog register refuses a racing register during artifact resolution", async () => {
+  it("SkillCatalog register queues a racing register behind artifact resolution", async () => {
     const server = await startDelayedEmbeddingServer();
     try {
       const embedding = { url: server.url, model: "test-model" };
@@ -785,13 +779,8 @@ describe("catalog experimentalEmbeddingArtifact", () => {
         catalog.register(slides),
         catalog.register(apiDesign),
       ]);
-      expect(settled.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
-      expect(settled[1]).toMatchObject({
-        status: "rejected",
-        reason: expect.objectContaining({
-          message: expect.stringMatching(/registry busy; await/),
-        }),
-      });
+      expect(settled.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(catalog.size()).toBe(2);
     } finally {
       await server.close();
     }
@@ -875,15 +864,16 @@ describe("catalog experimentalEmbeddingArtifact", () => {
         catalog.register(withExecute(readFileTool)),
         catalog.register(withExecute(writeFileTool)),
       ]);
+      // The first warm saw only its own corpus, so it succeeds. The second
+      // waits, then warms over a corpus the artifact does not cover; its
+      // metadata persists, as after any dense-preparation failure.
       expect(settled.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
-      expect(settled[1]).toMatchObject({
-        status: "rejected",
-        reason: expect.objectContaining({
-          message: expect.stringMatching(/registry busy; await/),
-        }),
-      });
+      const reason = (settled[1] as PromiseRejectedResult).reason;
+      expect(reason).toBeInstanceOf(ArtifactWarmError);
+      expect((reason as ArtifactWarmError).code).toBe("Incomplete");
+      expect((reason as ArtifactWarmError).missing).toEqual(["write_file"]);
       expect(catalog.has("read_file")).toBe(true);
-      expect(catalog.has("write_file")).toBe(false);
+      expect(catalog.has("write_file")).toBe(true);
     } finally {
       await server.close();
     }

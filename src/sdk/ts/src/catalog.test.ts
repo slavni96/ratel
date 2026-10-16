@@ -428,7 +428,7 @@ describe("ToolCatalog search methods", () => {
     }
   });
 
-  it("serializes queued dense searches and rejects registration until they settle", async () => {
+  it("serializes queued dense searches and makes registration wait until they settle", async () => {
     const server = await startDelayedEmbeddingServer();
     try {
       const catalog = new ToolCatalog({
@@ -440,12 +440,10 @@ describe("ToolCatalog search methods", () => {
       const started = Date.now();
       const first = catalog.searchAsync("read one", 5);
       const second = catalog.searchAsync("read two", 5);
-      await expect(catalog.register({ ...readFile, id: "later" })).rejects.toThrow(
-        /registry busy; await/,
-      );
+      await expect(catalog.register({ ...readFile, id: "later" })).resolves.toBeUndefined();
       await Promise.all([first, second]);
       expect(Date.now() - started).toBeGreaterThanOrEqual(200);
-      await expect(catalog.register({ ...readFile, id: "later" })).resolves.toBeUndefined();
+      expect(catalog.has("later")).toBe(true);
     } finally {
       await server.close();
     }

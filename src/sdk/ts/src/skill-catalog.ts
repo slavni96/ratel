@@ -1,6 +1,5 @@
 import { SearchTarget } from "@ratel-ai/telemetry";
 import type { NativeEventSubscription, ReplaceOutcome, Skill, SkillHit } from "../native/index.cjs";
-import { warmFromEmbeddingArtifactSource } from "./artifact-source-warm.js";
 import {
   assertValidRanking,
   CUSTOM_NEEDS_ASYNC,
@@ -26,7 +25,7 @@ import {
   type ExperimentalEmbeddingArtifact,
   resolveEmbeddingArtifact,
 } from "./embedding-artifact.js";
-import { type IntentGraph, SkillRegistry } from "./registry.js";
+import { type ArtifactResolver, type IntentGraph, SkillRegistry } from "./registry.js";
 import type { RuntimeEvent, RuntimeEventsOptions } from "./runtime-events.js";
 import { traceSearch, traceSearchAsync, traceSkillLoad } from "./telemetry.js";
 
@@ -173,6 +172,13 @@ export class SkillCatalog {
    * A model or dimension change is not recovered in place — construct a new
    * catalog and re-register.
    *
+   * With nothing in flight, the skills are indexed synchronously, at the call.
+   * While an asynchronous operation is in flight (a
+   * {@link SkillCatalog.searchAsync}, an embedding pass, a
+   * {@link SkillCatalog.replaceAll} still preparing), the write waits for it
+   * instead of failing, and a `searchAsync` started meanwhile runs after it —
+   * see {@link ToolCatalog.register}.
+   *
    * @param skills - A single skill or a readonly array of them. Pass the
    *   whole batch at once for a single dense-preparation request.
    */
@@ -180,7 +186,7 @@ export class SkillCatalog {
     const batch = Array.isArray(skills) ? skills : [skills];
     const localBatch = batch.map((skill) => structuredClone(skill));
     await this.registerEffective(
-      localBatch.map((skill) => this.applyDefinitionOverride(skill)),
+      () => localBatch.map((skill) => this.applyDefinitionOverride(skill)),
       localBatch,
     );
   }
@@ -191,12 +197,17 @@ export class SkillCatalog {
     options: DefinitionOverrideApplyOptions = {},
   ): Promise<void> {
     const { adopt = true, emitDefinitions = true } = options;
-    this.overrideSearchableDescriptions = new Map(overrides);
-    if (adopt) this.registry.setUseDefinitionOverrides();
+    const next = new Map(overrides);
+    // The overlay and its adoption take effect only with the swap: a refused
+    // apply must leave nothing behind for a register that lands after it.
     await this.replaceAllEffective(
-      [...this.localSkills.values()].map((skill) => this.applyDefinitionOverride(skill)),
+      () =>
+        [...this.localSkills.values()].map((skill) => this.applyDefinitionOverride(skill, next)),
       undefined,
-      emitDefinitions,
+      { emitDefinitions, adoptOverrides: adopt },
+      () => {
+        this.overrideSearchableDescriptions = next;
+      },
     );
   }
 
@@ -205,18 +216,21 @@ export class SkillCatalog {
     this.registry.setUseDefinitionOverrides([...this.skills.values()]);
   }
 
-  private async registerEffective(
-    batch: readonly Skill[],
+  /** Index `effective()` and prepare it, waiting for operations in flight. */
+  private registerEffective(
+    effective: () => readonly Skill[],
     localBatch?: readonly Skill[],
   ): Promise<void> {
-    this.registry.registerItems(batch);
-    if (localBatch) {
-      for (const skill of localBatch) this.localSkills.set(skill.id, skill);
-    }
-    for (const skill of batch) {
-      this.skills.set(skill.id, skill);
-    }
-    await this.ensureDenseReady();
+    return this.registry.mutate(() => {
+      const batch = effective();
+      this.registry.registerItems(batch);
+      if (localBatch) {
+        for (const skill of localBatch) this.localSkills.set(skill.id, skill);
+      }
+      for (const skill of batch) {
+        this.skills.set(skill.id, skill);
+      }
+    }, this.artifactResolver());
   }
 
   /**
@@ -241,10 +255,15 @@ export class SkillCatalog {
    *
    * A concurrent operation refuses the call outright rather than applying it
    * half-way, so two overlapping reloads can never blend into one corpus.
-   * Because the swap is the synchronous half, that refusal throws at the call
-   * site rather than rejecting the returned promise. Note that any in-flight
-   * {@link SkillCatalog.searchAsync} can trigger it, including a plain BM25 one
-   * — `registry busy` is retryable and not exclusive to dense work.
+   * Because the swap is the synchronous half, that refusal throws
+   * {@link RegistryBusyError} at the call site rather than rejecting the
+   * returned promise. It refuses while another reload or a
+   * {@link SkillCatalog.register} is still running or waiting, and while a
+   * native operation holds the registry; an in-flight
+   * {@link SkillCatalog.searchAsync} can trigger the latter, including a plain
+   * BM25 one. The error is retryable. Unlike `register`, it does not wait,
+   * because its counts are returned synchronously. A `register` made while its
+   * dense preparation runs waits for it.
    *
    * @param skills - The complete catalog contents. A repeated id keeps its last
    *   entry. An empty array clears the catalog.
@@ -261,49 +280,56 @@ export class SkillCatalog {
       if (!localIds.has(warnedId)) this.warnedShadowIds.delete(warnedId);
     }
     return this.replaceAllEffective(
-      localSkills.map((skill) => this.applyDefinitionOverride(skill)),
+      () => localSkills.map((skill) => this.applyDefinitionOverride(skill)),
       localSkills,
     );
   }
 
+  /**
+   * Swap the corpus for `effective()`, computed once the swap is admitted.
+   * `committed` runs only after the native swap succeeded, so a refusal
+   * changes nothing.
+   */
   private replaceAllEffective(
-    skills: readonly Skill[],
+    effective: () => readonly Skill[],
     localSkills?: readonly Skill[],
-    emitDefinitions = true,
+    { emitDefinitions = true, adoptOverrides = false } = {},
+    committed?: () => void,
   ): PendingReplace {
-    const outcome = this.registry.replaceAllItems(skills, emitDefinitions);
-    if (localSkills) {
-      this.localSkills.clear();
-      for (const skill of localSkills) this.localSkills.set(skill.id, skill);
-    }
-    this.skills.clear();
-    for (const skill of skills) {
-      this.skills.set(skill.id, skill);
-    }
+    let outcome: ReplaceOutcome | undefined;
+    // Runs the swap now or throws; the dense preparation holds the registry,
+    // so a register made meanwhile waits for it rather than failing.
+    const prepared = this.registry.mutateNow(() => {
+      const skills = effective();
+      outcome = this.registry.replaceAllItems(skills, emitDefinitions, adoptOverrides);
+      committed?.();
+      if (localSkills) {
+        this.localSkills.clear();
+        for (const skill of localSkills) this.localSkills.set(skill.id, skill);
+      }
+      this.skills.clear();
+      for (const skill of skills) {
+        this.skills.set(skill.id, skill);
+      }
+    }, this.artifactResolver());
+    const counts = outcome as ReplaceOutcome;
     // The counts ride on the promise itself, so a failed dense-preparation
     // phase still reports what the (already committed) swap changed.
-    const embedded = this.ensureDenseReady().then(() => outcome);
-    return Object.assign(embedded, outcome);
+    const embedded = prepared.then(() => counts);
+    return Object.assign(embedded, counts);
   }
 
-  private applyDefinitionOverride(skill: Skill): Skill {
-    return withDefinitionOverride(
-      "skill",
-      skill,
-      this.overrideSearchableDescriptions,
-      this.warnedShadowIds,
-    );
+  private applyDefinitionOverride(
+    skill: Skill,
+    overrides: ReadonlyMap<string, string> = this.overrideSearchableDescriptions,
+  ): Skill {
+    return withDefinitionOverride("skill", skill, overrides, this.warnedShadowIds);
   }
 
-  private async ensureDenseReady(): Promise<void> {
+  /** Resolves the configured embedding artifact, when there is one. */
+  private artifactResolver(): ArtifactResolver | undefined {
     const artifact = this.embeddingArtifact;
-    if (artifact) {
-      await warmFromEmbeddingArtifactSource(this.registry, () =>
-        resolveEmbeddingArtifact(artifact),
-      );
-      return;
-    }
-    await this.registry.buildDense();
+    return artifact ? () => resolveEmbeddingArtifact(artifact) : undefined;
   }
 
   /**

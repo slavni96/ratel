@@ -5,6 +5,7 @@ import * as sdk from "./index.js";
 import {
   ContentCapture,
   clearContentCapture,
+  RegistryBusyError,
   type SearchHit,
   type Skill,
   SkillRegistry,
@@ -168,11 +169,14 @@ describe("ToolRegistry", () => {
 
     const search = registry.searchWithMethodAsync("read", 5, "direct", "dense");
     const rejection = expect(search).rejects.toThrow(/not computed for semantic/);
-    await expect(registry.register(writeFile)).rejects.toThrow(/registry busy; await/);
+    // The alias takes the dense permit synchronously, so a synchronous write is
+    // refused, while an asynchronous register waits for the search instead.
+    expect(() => registry.registerItems(writeFile)).toThrow(RegistryBusyError);
+    await expect(registry.register(writeFile)).resolves.toBeUndefined();
     await rejection;
   });
 
-  it("rejects registration promptly instead of blocking behind active asynchronous bm25 reads", async () => {
+  it("waits for active asynchronous bm25 reads without blocking the event loop", async () => {
     const registry = new ToolRegistry();
     await registry.register(
       Array.from({ length: BM25_CONCURRENCY_CORPUS_SIZE }, (_, index) => ({
@@ -190,10 +194,15 @@ describe("ToolRegistry", () => {
     await new Promise((resolve) => setTimeout(resolve, 25));
 
     const startedAt = performance.now();
-    await expect(registry.register(writeFile)).rejects.toThrow(/registry busy; await/);
+    const registered = registry.register(writeFile);
+    // The call returns at once: the write waits on the event loop for the
+    // reads to settle, never on the native lock the workers hold.
     expect(performance.now() - startedAt).toBeLessThan(100);
-
+    await expect(registered).resolves.toBeUndefined();
     await Promise.all(searches);
+    expect(registry.search("write contents to a file", 5).map((hit) => hit.toolId)).toContain(
+      "write_file",
+    );
   }, 15_000);
 });
 
