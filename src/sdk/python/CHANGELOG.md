@@ -18,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **A trace sink or event subscriber attached after enable now receives `usage_ranking_status`.** The current status (with the last trigger's `reason`) is re-reported whenever one is installed while a graph is attached, so a consumer no longer has to subscribe before `experimental_enable_adaptive_ranking` to see it
 - **Runtime events never carry the raw embedder fingerprint, endpoint URL or local model path.** `usage_ranking_status.model`, `usage_model_mismatch` and `embedder_model_mismatch` carry a redacted `name#hash` identity, and the `embedder_*` events carry the model's public name. Before, an endpoint URL with a query-string API key reached every event subscriber (core fix, surfaced through this SDK)
 - **BM25 matches words like `codebase` and `database` again** (core fix, surfaced through this SDK). Since 0.13.0-rc.5 a query was stemmed twice, so a word whose stem changes on a second pass never matched any tool or skill; 0.12.0 was unaffected.
+- **A NaN score no longer panics a search or ranks it differently between runs** (core fix, surfaced through this SDK). A NaN cosine from an embedding vector that carries one compared equal to every score, so the sort could panic or leave an unspecified order; it now ranks after every real score. Rankings without a NaN are unchanged.
 
 ## [0.13.0-rc.11] - 2026-10-05
 
